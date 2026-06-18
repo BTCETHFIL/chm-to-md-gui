@@ -899,9 +899,9 @@ def convert_chm(chm_path, out_root, log):
     md_converter = MDConverter()
     base_dir = Path(out_root) / _safe_fn(p.stem)
 
-    # ── 初始化调试临时目录 (30分钟自动清理) ──
+    # ── 初始化调试临时目录 (使用系统临时目录，30分钟自动清理) ──
     dbg = TempFileManager.get()
-    dbg.init(Path(out_root), ttl=1800)
+    dbg.init(Path(tempfile.gettempdir()) / 'chm2md_debug', ttl=1800)
     dbg.write('_source_chm.txt', f"{p.name}\n{p.resolve()}\n")
 
     # ── Extract ──
@@ -1096,14 +1096,8 @@ def convert_chm(chm_path, out_root, log):
                 key = parent or '__root__'
                 groups.setdefault(key, []).append((parent, fn, title, hp_fname, has_children, number))
             else:
-                # 无TOC条目：按CHM内部路径镜像放置，方便与原始CHM对照
-                fn = _clean_path(title)
-                orphan_dir = _get_orphan_output_dir(base_dir, hp_key)
-                orphan_dir.mkdir(parents=True, exist_ok=True)
-                _write_page_md(md, title, orphan_dir, fn)
-                # 记录归类信息
-                orphan_cat = orphan_dir.name
-                orphans.setdefault(orphan_cat, []).append(fn)
+                # 无TOC条目：跳过，用户只需要TOC中的内容
+                continue
 
             log(f"  [{idx}/{total}] ✓ {fn}.md", 'success')
             success += 1
@@ -1127,15 +1121,6 @@ def convert_chm(chm_path, out_root, log):
         'output_dir': str(base_dir.resolve()),
         'orphans': {'total': sum(len(v) for v in orphans.values()), 'by_category': orphan_summary},
     })
-
-    # ── 生成导航索引 ──
-    if toc_root:
-        for key, entries in sorted(groups.items()):
-            if key == '__root__':
-                _write_index(base_dir, p.stem, entries, log)
-            else:
-                parent_dir = base_dir / key
-                _write_index(parent_dir, key.rsplit('/', 1)[-1] if '/' in key else key, entries, log)
 
     log(f"  完成: {p.name} → {success} 个 .md | {failed} 失败 | {skipped} 跳过", 'success')
     return success, base_dir
