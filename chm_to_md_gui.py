@@ -1516,13 +1516,27 @@ class App:
             tasks = [ip]
         elif mode == 'multi':
             if not self._files: messagebox.showwarning("提示", "请先选择文件！"); return
-            tasks = list(self._files)
+            tasks = sorted(self._files)
         else:
             ip = self.iv.get().strip()
             if not ip: messagebox.showwarning("提示", "请选择一个文件夹！"); return
             tasks = sorted(str(f) for f in Path(ip).glob("*.chm"))
             if not tasks:
                 messagebox.showwarning("提示", "文件夹中没有 .chm 文件"); return
+
+        # ── 多文件时询问是否整体统一编号 ──
+        unified = False
+        if len(tasks) > 1:
+            unified = messagebox.askyesno(
+                "编号方式",
+                f"检测到 {len(tasks)} 个 CHM 文件。\n\n"
+                "是否整体统一编号？\n\n"
+                "  [是] — 所有文件按顺序统一编号\n"
+                "         (如第3本书的1.2节 → 3.1.2)\n"
+                "  [否] — 每个文件独立编号\n"
+                "         (每个文件都从1开始)\n\n"
+                "建议选择 [是]，方便跨文件检索。"
+            )
 
         self.run = True
         self.btn.config(text="转换中...", state='disabled')
@@ -1535,12 +1549,16 @@ class App:
                 self._log("=" * 50, 'info')
                 count = 0; total = len(tasks)
                 self._log(f"待处理文件数: {total}", 'info')
+                if unified:
+                    self._log("编号方式: 整体统一编号", 'info')
+                else:
+                    self._log("编号方式: 各文件独立编号", 'info')
                 for i, cf in enumerate(tasks):
                     pct = 10 + 85 * i // total if total else 100
                     self.r.after(0, lambda p=pct, t=f"{i+1}/{total}": (
                         self.pv.set(p), self.pl.config(text=t)))
                     try:
-                        bnum = (i + 1) if mode == 'folder' else None
+                        bnum = (i + 1) if unified else None
                         n, out_dir = convert_chm(
                             cf, op, lambda m, t='info': self._log(m, t), bnum)
                         count += n
