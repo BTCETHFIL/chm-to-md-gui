@@ -1030,18 +1030,21 @@ def convert_chm(chm_path, out_root, log, book_num=None):
         ]
     })
 
-    # ── 折叠根级目录 (三层→两层): 根级 has_children 条目提升一级 ──
+    # ── 折叠根级目录 (三层→两层): 循环递归折叠，直到根级无has_children ──
     if book_num is not None and toc_root and toc_root.children:
         first_child_title = _clean_path(toc_root.children[0].title)
         base_dir = Path(out_root) / f"{book_num:02d}_{first_child_title}"
-        # 收集所有根级目录条目 (parent="", has_children=True)
-        _root_dir_names = {e[1] for e in flat if e[0] == "" and e[4]}
-        if _root_dir_names:
+        # 递归折叠：每次消去一层根级目录节点，直到根级只有叶子
+        collapse_rounds = 0
+        while collapse_rounds < 50:  # 防护上限
+            _root_dir_names = {e[1] for e in flat if e[0] == "" and e[4]}
+            if not _root_dir_names:
+                break
             new_flat = []
             for entry in flat:
                 parent, fn, title, local, has_children, number = entry
                 if parent == "" and has_children:
-                    # 根级目录条目 → 变成文件直接放在 base_dir 下
+                    # 根级目录条目 → 变为叶子文件
                     new_flat.append(("", fn, title, local, False, number))
                 elif parent in _root_dir_names:
                     # 被折叠条目的直接子节点 → 提升到根级
@@ -1056,8 +1059,11 @@ def convert_chm(chm_path, out_root, log, book_num=None):
                         new_flat.append(entry)
                 else:
                     new_flat.append(entry)
-            log(f"  📐 折叠根级目录: {len(_root_dir_names)} 个 → 输出到 {base_dir.name}/", 'info')
+            if new_flat == flat:
+                break  # 无变化，防止死循环
             flat = new_flat
+            collapse_rounds += 1
+        log(f"  📐 折叠根级目录 ({collapse_rounds}轮) → 输出到 {base_dir.name}/", 'info')
     else:
         base_dir = Path(out_root) / _safe_fn(f"{book_num:02d}_{p.stem}" if book_num else p.stem)
 
@@ -1219,124 +1225,7 @@ def _write_page_md(md, title, out_dir, fn):
     fp.write_text(md, encoding='utf-8')
 
 
-def _copy_images(files_dict, assets_dir, log):
-    """复制图片文件到assets/images/"""
-    assets_dir.mkdir(parents=True, exist_ok=True)
-    img_exts = {'.png', '.jpg', '.jpeg', '.gif', '.bmp', '.svg'}
-    count = 0
-    for k, v in files_dict.items():
-        ext = Path(k).suffix.lower()
-        if ext in img_exts:
-            try:
-                target = assets_dir / Path(k).name
-                if not target.exists():
-                    target.write_bytes(v)
-                    count += 1
-            except Exception:
-                pass
-    if count > 0:
-        log(f"  🖼  复制了 {count} 张图片到 assets/images/", 'info')
-    return count
 
-
-def _save_toc_outputs(toc_root, toc_parser, base_dir, log):
-    """保存toc.json / TOC.md / file_mapping.json"""
-    try:
-        # toc.json
-        toc_json = {"version": "1.0.0", "tree": toc_root.to_dict()}
-        (base_dir / 'toc.json').write_text(
-            json.dumps(toc_json, ensure_ascii=False, indent=2), encoding='utf-8')
-        log("  📄 toc.json", 'info')
-
-        # TOC.md
-        toc_md_content = "# 文档目录\n\n本目录由CHM文件的目录树自动生成。\n\n"
-        toc_md_content += _toc_to_markdown(toc_root)
-        (base_dir / 'TOC.md').write_text(toc_md_content, encoding='utf-8')
-        log("  📄 TOC.md", 'info')
-
-        # file_mapping.json
-        md_mapping = {}
-        for html_path, title in toc_parser.file_mapping.items():
-            md_path = re.sub(r'\.html?$', '.md', html_path)
-            md_mapping[md_path] = title
-        mapping_data = {"version": "1.0.0", "count": len(md_mapping), "mapping": md_mapping}
-        (base_dir / 'file_mapping.json').write_text(
-            json.dumps(mapping_data, ensure_ascii=False, indent=2), encoding='utf-8')
-        log("  📄 file_mapping.json", 'info')
-    except Exception as e:
-        log(f"  ⚠ 目录输出错误: {e}", 'info')
-
-
-def _toc_to_markdown(node, indent=0):
-    """递归转换TOC树为Markdown（带层级数字编号）"""
-    lines = []
-    prefix = "    " * indent
-    for child in node.children:
-        num_prefix = f"{child.number}  " if child.number else ""
-        if child.file_path:
-            md_path = re.sub(r'\.html?$', '.md', child.file_path)
-            lines.append(f"{prefix}- [{num_prefix}{child.title}]({md_path})")
-        else:
-            lines.append(f"{prefix}- {num_prefix}{child.title}")
-        if child.children:
-            lines.append(_toc_to_markdown(child, indent + 1))
-    return '\n'.join(lines)
-
-
-def _create_metadata(chm_path, base_dir, stats, log):
-    """创建metadata.json"""
-    metadata = {
-        "version": "1.0.0",
-        "source": {
-            "file": chm_path.name,
-            "size": chm_path.stat().st_size,
-            "date": datetime.fromtimestamp(chm_path.stat().st_mtime).isoformat(),
-        },
-        "converted": {
-            "date": datetime.now().isoformat(),
-            "tool": "chm-to-markdown-converter",
-            "version": "2.0.0",
-        },
-        "statistics": stats,
-    }
-    (base_dir / 'metadata.json').write_text(
-        json.dumps(metadata, ensure_ascii=False, indent=2), encoding='utf-8')
-    log("  📄 metadata.json", 'info')
-
-
-def _create_readme(base_dir, name, stats, log):
-    """创建README.md"""
-    content = f"""# {name.upper()} 文档
-
-本文档由CHM文件自动转换而成。
-
-## 转换信息
-- 转换时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
-- 总文件数: {stats['total']}
-- 转换成功: {stats['success']}
-- 转换失败: {stats['failed']}
-- 跳过文件: {stats['skipped']}
-- 图片数量: {stats['images']}
-
-## 文档结构
-- `toc.json` — 结构化目录树
-- `TOC.md` — 可读目录树
-- `file_mapping.json` — 文件名→标题映射
-- `metadata.json` — 转换统计
-- `assets/images/` — 图片资源
-- `*.md` — 转换后的Markdown文件
-
-## 使用说明
-1. 使用IDE的搜索功能可以直接搜索和查询文档内容
-2. 所有图片资源保存在 `assets/images/` 目录下
-3. 内部链接已转换为 `.md` 格式
-
-## 注意事项
-- 部分复杂的HTML格式可能在转换过程中丢失
-- 建议查看原始CHM文件以确认关键信息
-"""
-    (base_dir / 'README.md').write_text(content, encoding='utf-8')
-    log("  📄 README.md", 'info')
 
 
 # ═══════════════════ Tkinter GUI ═══════════════════
