@@ -907,7 +907,6 @@ def convert_chm(chm_path, out_root, log, book_num=None):
     log("-" * 50, 'info')
 
     md_converter = MDConverter()
-    base_dir = Path(out_root) / _safe_fn(f"{book_num:02d}_{p.stem}" if book_num else p.stem)
 
     # ── 初始化调试临时目录 (使用系统临时目录，30分钟自动清理) ──
     dbg = TempFileManager.get()
@@ -935,7 +934,7 @@ def convert_chm(chm_path, out_root, log, book_num=None):
 
     if not html_map:
         log("  中止: 未找到 HTML 文件", 'error')
-        return 0, base_dir
+        return 0, Path(out_root) / _safe_fn(p.stem)
 
     # ── Parse TOC (主 + 合并子CHM) ──
     hhc_data = next((v for k, v in files.items() if k.lower().endswith('.hhc')), None)
@@ -1025,6 +1024,37 @@ def convert_chm(chm_path, out_root, log, book_num=None):
             for p, f, t, l, h, n in flat
         ]
     })
+
+    # ── 折叠根级目录 (三层→两层): 根级 has_children 条目提升一级 ──
+    if book_num is not None and toc_root and toc_root.children:
+        first_child_title = _clean_path(toc_root.children[0].title)
+        base_dir = Path(out_root) / f"{book_num:02d}_{first_child_title}"
+        # 收集所有根级目录条目 (parent="", has_children=True)
+        _root_dir_names = {e[1] for e in flat if e[0] == "" and e[4]}
+        if _root_dir_names:
+            new_flat = []
+            for entry in flat:
+                parent, fn, title, local, has_children, number = entry
+                if parent == "" and has_children:
+                    # 根级目录条目 → 变成文件直接放在 base_dir 下
+                    new_flat.append(("", fn, title, local, False, number))
+                elif parent in _root_dir_names:
+                    # 被折叠条目的直接子节点 → 提升到根级
+                    new_flat.append(("", fn, title, local, has_children, number))
+                elif "/" in parent:
+                    # 检查是否更深层后代需要减少一级前缀
+                    top = parent.split("/", 1)[0]
+                    if top in _root_dir_names:
+                        new_parent = parent[len(top) + 1:]
+                        new_flat.append((new_parent, fn, title, local, has_children, number))
+                    else:
+                        new_flat.append(entry)
+                else:
+                    new_flat.append(entry)
+            log(f"  📐 折叠根级目录: {len(_root_dir_names)} 个 → 输出到 {base_dir.name}/", 'info')
+            flat = new_flat
+    else:
+        base_dir = Path(out_root) / _safe_fn(f"{book_num:02d}_{p.stem}" if book_num else p.stem)
 
     # ── Build TOC map (full-path + basename fallback) ──
     toc_map = {}       # 完整路径匹配 (去碎片后)
