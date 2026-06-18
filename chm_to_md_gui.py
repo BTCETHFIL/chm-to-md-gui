@@ -60,15 +60,20 @@ def _clean_path(text):
     return text or "untitled"
 
 def _safe_fn(text):
-    """Pinyin filename for CHM root directory"""
+    """ASCII优先命名：保留英文/数字，丢弃中文；纯中文才兜底拼音"""
     if not text: return "untitled"
-    text = re.sub(r'[<>:"/\\|?*]', '', text).strip()
-    if not text: return "untitled"
-    if HAS_PYPINYIN and any('\u4e00' <= c <= '\u9fff' for c in text):
+    # 优先：只保留 ASCII 字符，丢弃中文等非 ASCII 部分
+    ascii_only = re.sub(r'[^\x00-\x7F]+', '', text)
+    ascii_only = re.sub(r'[<>:"/\\|?*]', '', ascii_only).strip()
+    ascii_only = re.sub(r'\s+', '_', ascii_only)
+    ascii_only = re.sub(r'[^a-zA-Z0-9_\-.]', '', ascii_only).lstrip('._')
+    result = ascii_only.lower()[:100]
+    if result:
+        return result
+    # 兜底：纯中文等无 ASCII 内容时，用拼音
+    if HAS_PYPINYIN:
         return '_'.join(lazy_pinyin(text)).lower()[:100]
-    text = re.sub(r'\s+', '_', text)
-    text = re.sub(r'[^a-zA-Z0-9_\-.]', '', text).lstrip('._')
-    return (text or "untitled").lower()[:100]
+    return "untitled"
 
 
 # ═══════════════════ Temp File Manager (auto-cleanup) ═══════════════════
