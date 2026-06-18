@@ -1,0 +1,6 @@
+beautifulsoup4>=4.12.0
+html2text>=2024.2
+pypinyin>=0.51.0
+chardet>=5.2.0
+lxml>=5.1.0
+
