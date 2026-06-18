@@ -1102,9 +1102,10 @@ def convert_chm(chm_path, out_root, log, book_num=None):
                 out_dir = base_dir / parent if parent else base_dir
                 out_dir.mkdir(parents=True, exist_ok=True)
                 if has_children:
+                    # 文件夹自身的内容页用纯标题命名（编号已在目录名中体现）
                     page_dir = out_dir / fn
                     page_dir.mkdir(parents=True, exist_ok=True)
-                    _write_page_md(md, title, page_dir, fn)
+                    _write_page_md(md, title, page_dir, _clean_path(title))
                 else:
                     _write_page_md(md, title, out_dir, fn)
                 key = parent or '__root__'
