@@ -1,6 +1,6 @@
-# 项目经验教训
+# 项目经验教训（跨项目全局共享）
 
-本文档记录 CHM 转 Markdown GUI 工具开发过程中踩过的坑和应对策略，供后续项目参考。
+本文档记录所有自编小程序开发过程中踩过的坑和应对策略，不限于某个具体项目。新增条目追加到末尾，按编号递增。涉及的项目包括 CHM 转 Markdown、知乎爬虫、微博爬虫等。
 
 ---
 
@@ -263,4 +263,201 @@ TOCNode (类) → 6元组 (parent, fn, title, local, has_children, number) → t
 
 ---
 
-*记录于 2026-06-18，最后更新于 2026-06-18*
+## 15. GitHub 发布前 .gitignore 的精确性
+
+**问题**：知乎爬虫项目的 `.gitignore` 写了 `*.json` + `!config.json` 例外。这导致 `id_list.json`（用户 ID 管理数据，需要跟踪）被误拦截，同时 `browser_data/zhihu_state.json`（含完整 Cookie）依赖目录级忽略才逃过一劫——如果哪天 `browser_data/` 规则被误删，敏感数据会直接暴露。
+
+**方案**：放弃 `*.json` 通配，改用精确规则：
+```gitignore
+# 个人配置文件（含本地 Chrome 路径等）
+config.json
+
+# 爬虫输出 & 敏感数据（整目录忽略）
+output/
+browser_data/
+```
+
+**教训**：
+- `.gitignore` 中通配规则越宽，越容易产生意外（误伤或漏网）。优先使用目录级忽略 + 明确的文件名。
+- `!exception` 规则叠加宽泛通配会增加心智负担——不如直接不写宽泛规则。
+- 总是在发布前执行 `git add --dry-run .` 验证哪些文件会被跟踪。
+
+---
+
+## 16. 个人配置与模板分离
+
+**问题**：`config.json` 包含用户本地 Chrome 路径（`C:\Program Files\...`），直接入库会暴露个人信息且无法被他人使用。但项目又需要一个配置参考，让新用户知道有哪些选项。
+
+**方案**：双文件策略：
+- `config.json` → 加入 `.gitignore`，不入库
+- `config.example.json` → 入库跟踪，所有字段填入示例/空值，加 `_comment` 提示"复制此文件为 config.json"
+
+**同样适用于** `id_list.json`：入库前重置为 `{"users":[],"updated":""}` 空白模板，避免泄露个人追踪数据。
+
+**教训**：
+- 任何含个人路径、用户名、API Key 的配置都应提供 `.example` 模板而非直接入库
+- 用户数据文件（如历史记录、追踪列表）入库前必须清空为模板状态
+- `git add --dry-run` 是发布前最后一道防线
+
+---
+
+## 17. README 与代码同步
+
+**问题**：知乎爬虫重构后（移除 3 种输出模式复选框、新增法务模式独立勾选），README 仍然显示旧的 UI 示意图（含"☑下载图片 ☐无头模式"）和过时的配置表（缺少 `forensic_mode`、`test_mode` 等字段）。
+
+**修复**：
+- 移除 ASCII 示意图（GUI 界面变化频繁，文字图跟不上），改为项目结构列表
+- 补全配置参数表所有字段
+- 增加混合输出模式、法务证据模式的文字说明
+
+**教训**：
+- 每次重构结束必须同步更新 README，作为发布流程的最后一步
+- 文字描述比 ASCII 示意图更易维护——图需要逐行对齐，改一个字符可能整幅图错位
+- 配置表用 Markdown 表格形式，增删字段只需加一行，比示意图低维护成本
+
+---
+
+## 18. 未使用依赖的清理
+
+**问题**：知乎爬虫的 `requirements.txt` 列出 `httpx>=0.27.0`，但全局搜索代码无任何 `import httpx`。这是早期开发时预备引入但最终用了 `requests` 的遗留。
+
+**修复**：直接删除，保持 `requirements.txt` 精确反映实际依赖。
+
+**教训**：
+- 发布前用 `grep -r "import httpx"` 或 IDE 全局搜索验证每个依赖是否真正被使用
+- 每个未使用的依赖都会增加安装时间、依赖冲突风险和安全攻击面
+- 这也是 `pip freeze > requirements.txt` 的问题——它会倾倒所有传递依赖，应该手工维护顶层依赖列表
+
+---
+
+## 19. 模块级单例与 UI 实例的双对象陷阱
+
+**问题**：知乎爬虫 GUI 中，`config.py` 在模块导入时创建全局单例 `config = Config.from_file()`。GUI 又通过 `self._cfg = Config.from_file()` 创建了**第二个实例**。用户勾选"测试模式"后，`_read_config_from_ui()` 只修改了 `self._cfg.test_mode = True` 并保存到 `config.json`，但爬虫线程读取的是模块级 `config.test_mode`——这个单例自导入后再未被更新，始终为 `False`。
+
+结果是：GUI 显示"🧪 测试模式: 开启"，但爬虫仍然滚动了 134 条回答才停。
+
+**修复**：在 `_read_config_from_ui()` 末尾，`save()` 之后增加同步：
+```python
+# 同步到模块级 config 单例（爬虫线程读取此对象）
+for f in self._cfg.__dataclass_fields__:
+    setattr(config, f, getattr(self._cfg, f))
+```
+
+**教训**：
+- 模块级单例 + UI 层实例 = 双对象，两边必须同步，否则静默不一致
+- 测试模式这种"看起来对但实际无效"的 bug 远比崩溃难发现——日志显示"测试模式开启"但行为不符
+- 简单自查：项目中 `from xxx import obj` 的模块级单例有几处被修改？修改都同步回去了吗？
+- 如果可能，设计上避免双对象——要么 UI 直接改 `config`，要么爬虫始终从文件重读
+
+---
+
+## 20. Playwright `:has-text` 伪类仅在 locator() 可用
+
+**问题**：知乎爬虫在 `page.query_selector('button:has-text("评论")')` 和 `card.query_selector('button:has-text("阅读全文")')` 中使用 `:has-text`，运行时报错：
+```
+':has-text' was detected as a pseudo-class and is either unsupported or invalid
+```
+
+**根因**：`:has-text()` 是 Playwright 专有伪类，仅在其 `locator()` API 中生效。`page.query_selector()` 和 `element_handle.query_selector()` 走的是浏览器原生 CSS 选择器，不支持 `:has-text`。
+
+**修复**：
+- 页面级搜索 → 改用 `page.locator('button:has-text("阅读全文")').first`，通过 `.count() > 0` 判断存在
+- 元素级搜索 → 先尝试标准 CSS 选择器，不命中时手动遍历 `card.query_selector_all('button')` 再按 `inner_text()` 筛选
+
+**教训**：
+- Playwright 中 `locator()` 和 `query_selector()` 是两套选择器引擎，伪类不通用
+- 凡是含 `:has-text`、`:has()`、`:is()` 等非标准伪类的选择器，必须走 `locator()`
+- 元素级搜索没有 `locator()` 可用时，fallback 到手动遍历 + 文本匹配
+
+---
+
+## 21. BS4 不支持 `:has-text`；用 find 代替
+
+**问题**：`converter.py` 中 `soup.select_one('button:has-text("评论")')` 同样报了 `:has-text` 不支持。
+
+**修复**：去掉 `'button:has-text("评论")'` 选择器，改用 BeautifulSoup 的 `soup.find('button', string=re.compile(r'评论'))`
+
+**教训**：
+- BeautifulSoup 的 `select_one/select` 走的是 CSS 选择器（基于 SoupSieve），仅支持标准 CSS 伪类
+- 需要按文本内容查找时 → `soup.find(tag, string=regex)` 或手动遍历
+- `:has-text`、`:has()` 这类"快捷语法"在不同库间不可移植
+
+---
+
+*记录于 2026-06-18，最后更新于 2026-06-19*
+
+---
+
+## 22. 爬虫长时任务需要短时缓存避免重复网络请求
+
+**场景**：知乎爬虫测试模式下爬了 5 条，二次运行时（比如上次没正确保存）需要重新滚动加载回答列表、逐条打开回答页、截图转 Markdown，即使距离上次运行只有几分钟。
+
+**根因**：爬虫无状态，每次启动从头开始收集链接→逐条请求，不记忆最近已获取的内容。
+
+**解决方案**：引入双层短时缓存（TTL 可配，默认 30 分钟）：
+
+| 缓存层 | 存储位置 | 内容 | 命中后跳过 |
+|--------|---------|------|-----------|
+| 链接列表缓存 | `cache/links.json` | 滚动收集的回答链接 + 时间戳 | `collect_answer_links()` 全流程 |
+| 回答内容缓存 | `cache/{answer_id}.json` | meta/md_text/html/screenshot | `crawl_answer_combined()` 单页请求 |
+
+**实现要点**：
+- 缓存独立于 progress.json（进度保存失败不影响缓存命中）
+- 每次爬取成功后写入缓存，下次运行命中时跳过网络 + 截图开销
+- GUI 提供 "缓存有效期(分)" 设置，设 0 可完全禁用
+- `collect_answer_links` 开头检查链接缓存，命中直接 return
+- 逐条爬取循环中 `load_answer_cache()` → 命中则跳过 `crawl_answer_combined()`
+
+**教训**：
+- 爬虫项目的"断点续传"不应只依赖磁盘文件，内存级的短时缓存是好补充
+- 两层缓存各自独立：链接缓存过期=重新滚动，内容缓存过期或用完=重新请求单条
+- TTL 设为 0 = 禁用，这是配置开关的标准设计模式
+
+---
+
+## 23. HTML 提取时嵌套按钮文字会污染数据
+
+**场景**：知乎爬虫提取回答作者名时，`extract_answer_meta` 从 `.AuthorInfo-name` 取 `get_text(strip=True)`，结果得到"祈祈关注"——因为作者名元素内嵌套了"关注"按钮，`get_text()` 会把子孙文本全部拼接。
+
+**修复**：提取后加清洗步骤：`re.sub(r'关注\s*$', '', author).strip()`
+
+**教训**：
+- `get_text(strip=True)` 会递归提取所有后代文本节点，包括嵌套按钮文字
+- 爬虫中凡是提取"名称"类字段（作者、标题、分类），都应怀疑是否有 UI 控件文字混入
+- 清洗正则要保守：`关注\s*$` 只去尾部，避免误删名字中间含"关注"的合法用词
+
+---
+
+## 24. 截图应裁剪到内容区而非整页
+
+**场景**：知乎回答页右侧有"相关推荐""创作者信息"等侧边栏，`page.screenshot(full_page=True)` 截下整页，文件膨胀且偏离证据目的。
+
+**方案**：三级回退策略截取内容区：
+1. 定位主内容列容器（`.Question-mainColumn`）→ `element.screenshot()`
+2. 拼接问题标题 + 回答卡片的 bounding box → `page.screenshot(clip=...)`
+3. 回退整页截图
+
+**教训**：
+- `element.screenshot()` 比整页截图更精准，字节量更小（base64 嵌入 MD 最敏感）
+- `clip` 参数需要同时知道 x/y/width/height，跨元素拼接时注意取 min/max 计算矩形
+- 三级回退保证健壮性：知乎改版导致选择器失效不会让截图功能全灭
+- alt 文本要与实际截图内容匹配——从「整页截图」改为「问题与回答截图」
+
+---
+
+## 25. 短时缓存在测试迭代中会成为"静默陷阱"
+
+**场景**：改完爬虫代码（author清洗/影响力数据/截图裁剪）后重跑，输出 MD 毫无变化。排查发现两个旧数据源拦截了新代码：`progress.json` 跳过已完成的回答 ID（"⏭ 跳过 5 条已完成"），回答内容缓存直接返回旧 `md_text/base64`。
+
+**修复**：新增 `force_no_cache` 配置项 + GUI 复选框，启用后三重拦截生效：
+1. `storage.py`：`load_links_cache`/`load_answer_cache` 直接返回 None
+2. `crawler.py`：`crawl_user_answers` 清空 `completed_set`，全部视为新条目
+3. `gui.py`：启动日志提示"🔄 强制忽略缓存: 开启"
+
+**教训**：
+- 缓存系统必须配套"一键旁路"开关，否则每次改代码验证都得手动删 `cache/` + `progress.json`
+- 旁路开关应覆盖所有缓存层：内存层(TTL检查)、存储层(JSON文件)、进度层(completed_set)
+- 开关命名要直白——"强制忽略缓存"比"禁用TTL"或"清理模式"更能让用户立即理解用途
+- GUI 应当有视觉提示：勾选后爬取量可能翻倍，需和测试模式搭配使用
+
+*记录于 2026-06-18，最后更新于 2026-06-19*
