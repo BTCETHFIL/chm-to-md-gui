@@ -1274,6 +1274,82 @@ class Tooltip:
             self.tip = None
 
 
+def _split_large_md(filepath, max_mb=10, log=None):
+    """将过大的 .md 文件按 H2 标题边界分割，每个分块 < max_mb MB。
+    返回: (是否分割, 生成文件数)"""
+    import re as _re
+    fp = Path(filepath)
+    if not fp.exists():
+        return False, 0
+    raw = fp.read_bytes()
+    if len(raw) <= max_mb * 1024 * 1024:
+        return False, 0
+    text = raw.decode('utf-8', errors='replace')
+    lines = text.split('\n')
+    # 找 H2 边界
+    h2_idx = [0]
+    for i, line in enumerate(lines):
+        if _re.match(r'^##\s', line):
+            h2_idx.append(i)
+    h2_idx.append(len(lines))
+    # 构建 section 列表 (start, end, text)
+    sections = []
+    for j in range(len(h2_idx) - 1):
+        s, e = h2_idx[j], h2_idx[j + 1]
+        sections.append((s, e, '\n'.join(lines[s:e])))
+    max_bytes = max_mb * 1024 * 1024
+    chunks = []
+    cur_text = ''
+    cur_start = 0
+    for s, e, sec_text in sections:
+        sec_b = len(sec_text.encode('utf-8'))
+        if sec_b > max_bytes:
+            # 大 section：按行级分割
+            if cur_text:
+                chunks.append((cur_start, cur_text))
+                cur_text = ''
+            chunk_lines = []
+            cstart = s
+            for k in range(s, e):
+                lb = len((lines[k] + '\n').encode('utf-8'))
+                if chunk_lines and len('\n'.join(chunk_lines + [lines[k]]).encode('utf-8')) > max_bytes:
+                    chunks.append((cstart, '\n'.join(chunk_lines)))
+                    chunk_lines = [lines[k]]
+                    cstart = k
+                else:
+                    chunk_lines.append(lines[k])
+            if chunk_lines:
+                chunks.append((cstart, '\n'.join(chunk_lines)))
+            cur_start = e
+            continue
+        # 正常累积
+        test = cur_text + '\n' + sec_text if cur_text else sec_text
+        if len(test.encode('utf-8')) > max_bytes and cur_text:
+            chunks.append((cur_start, cur_text))
+            cur_text = sec_text
+            cur_start = s
+        else:
+            cur_text = test
+            if cur_start == 0:
+                cur_start = s
+    if cur_text:
+        chunks.append((cur_start, cur_text))
+    if len(chunks) <= 1:
+        return False, 0
+    # 写入分块
+    stem, ext = fp.stem, fp.suffix
+    for ci, (_, chunk_text) in enumerate(chunks, 1):
+        new_path = fp.parent / f'{stem}({ci}){ext}'
+        new_path.write_text(chunk_text + '\n' if not chunk_text.endswith('\n') else chunk_text, encoding='utf-8')
+        if log:
+            cmb = len(chunk_text.encode('utf-8')) / (1024 * 1024)
+            log(f"    → {new_path.name} ({cmb:.1f} MB)", 'info')
+    fp.unlink()
+    if log:
+        log(f"  ✂ 分割完成: {fp.name} → {len(chunks)} 个文件", 'info')
+    return True, len(chunks)
+
+
 class App:
     def __init__(self, r):
         self.r = r
@@ -1395,7 +1471,7 @@ class App:
             bg='#1e1e1e', fg='#d4d4d4', insertbackground='white',
             relief='flat', borderwidth=0)
         self.log.pack(fill='both', expand=True)
-        for tg, cl in [('success', '#4ec9b0'), ('error', '#f44747'), ('info', '#569cd6')]:
+        for tg, cl in [('success', '#4ec9b0'), ('error', '#f44747'), ('info', '#569cd6'), ('warn', '#e5b73c')]:
             self.log.tag_configure(tg, foreground=cl)
 
     def _fm(self):
@@ -1492,6 +1568,21 @@ class App:
                 self.r.after(0, lambda: (self.pv.set(100), self.pl.config(text="完成！")))
                 self._log(f"\n总计: {count} 个 .md 文件（来自 {total} 个 CHM）", 'success')
                 self._log(f"输出目录: {Path(op).resolve()}", 'info')
+                # ── 检测过大文件 ──
+                out_path = Path(op)
+                big_files = []
+                for mf in sorted(out_path.rglob('*.md')):
+                    if not mf.is_file():
+                        continue
+                    sz = mf.stat().st_size
+                    if sz > 10 * 1024 * 1024:
+                        big_files.append((str(mf), sz))
+                if big_files:
+                    self._log(f"\n⚠ 检测到 {len(big_files)} 个文件超过 10 MB:", 'warn')
+                    for bf, sz in big_files:
+                        self._log(f"  {Path(bf).name} ({sz / 1024 / 1024:.1f} MB)", 'warn')
+                    # 在主线程弹窗询问
+                    self.r.after(0, lambda bf=big_files: self._ask_split(bf))
             except Exception as e:
                 self._log(f"致命错误: {e}", 'error')
                 import traceback; self._log(traceback.format_exc(), 'error')
@@ -1506,6 +1597,37 @@ class App:
             return
         TempFileManager.get().shutdown()
         self.r.destroy()
+
+    def _ask_split(self, big_files):
+        """弹窗询问是否分割过大 .md 文件"""
+        if not big_files:
+            return
+        names = '\n'.join(f'  · {Path(f).name} ({s / 1024 / 1024:.1f} MB)' for f, s in big_files[:20])
+        if len(big_files) > 20:
+            names += f'\n  ... 共 {len(big_files)} 个'
+        ok = messagebox.askyesno(
+            "分割大文件",
+            f"检测到 {len(big_files)} 个 .md 文件超过 10 MB：\n\n"
+            f"{names}\n\n"
+            f"GitHub 单文件限制 100 MB，但大文件影响浏览和检索。\n"
+            f"是否按 H2 标题自动分割为 <10 MB 的小文件？\n\n"
+            f"分割后编号保留，仅加 (1)(2)(3) 后缀。"
+        )
+        if ok:
+            self._log("\n✂ 开始分割大文件...", 'info')
+            threading.Thread(target=self._do_split, args=(big_files,), daemon=True).start()
+
+    def _do_split(self, big_files):
+        """在后台线程执行文件分割"""
+        count = 0
+        for fp, sz in big_files:
+            try:
+                did, n = _split_large_md(fp, 10, lambda m, t='info': self._log(m, t))
+                if did:
+                    count += 1
+            except Exception as e:
+                self._log(f"  ✗ 分割失败 {Path(fp).name}: {e}", 'error')
+        self._log(f"✂ 分割完成: {len(big_files)} 个文件 → {count} 个已分割", 'success')
 
 
 if __name__ == '__main__':
