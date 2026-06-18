@@ -846,6 +846,10 @@ def _toc_to_flat(node, prefix=''):
         clean = _clean_path(title) if title else 'untitled'
         number = child.number or ''
 
+        # 将数字编号加入目录/文件名，如 "1.1.2 VBScript基础"
+        if number:
+            clean = f"{number} {clean}"
+
         if has_children:
             child_prefix = f"{prefix}/{clean}" if prefix else clean
             # 无local的纯分组节点也收录（如"杂项"），toc_map构建时会自动跳过
@@ -1112,7 +1116,7 @@ def convert_chm(chm_path, out_root, log):
     stats = {"total": total, "success": success, "failed": failed, "skipped": skipped,
              "images": 0, "has_toc": toc_root is not None}
 
-    # 调试: 记录转换摘要和输出结构
+    # 调试: 记录转换摘要
     orphan_summary = {}
     for cat, items in orphans.items():
         orphan_summary[cat] = {'count': len(items), 'files': sorted(items)[:50]}
@@ -1123,20 +1127,15 @@ def convert_chm(chm_path, out_root, log):
         'output_dir': str(base_dir.resolve()),
         'orphans': {'total': sum(len(v) for v in orphans.values()), 'by_category': orphan_summary},
     })
-    # 写入目录结构快照（在TOC/README/metadata生成前）
-    _dump_tree_snapshot(dbg, base_dir, '_tree_before_meta.txt')
 
-    # ── 生成输出文档 ──
-    img_count = _copy_images(files, base_dir / 'assets' / 'images', log)
-    stats['images'] = img_count
-
+    # ── 生成导航索引 ──
     if toc_root:
-        _save_toc_outputs(toc_root, toc_parser, base_dir, log)
-
-    _create_metadata(p, base_dir, stats, log)
-    _create_readme(base_dir, p.stem, stats, log)
-    # 写入最终目录结构快照
-    _dump_tree_snapshot(dbg, base_dir, '_final_tree.txt')
+        for key, entries in sorted(groups.items()):
+            if key == '__root__':
+                _write_index(base_dir, p.stem, entries, log)
+            else:
+                parent_dir = base_dir / key
+                _write_index(parent_dir, key.rsplit('/', 1)[-1] if '/' in key else key, entries, log)
 
     log(f"  完成: {p.name} → {success} 个 .md | {failed} 失败 | {skipped} 跳过", 'success')
     return success, base_dir
@@ -1550,12 +1549,6 @@ class App:
                 self.r.after(0, lambda: (self.pv.set(100), self.pl.config(text="完成！")))
                 self._log(f"\n总计: {count} 个 .md 文件（来自 {total} 个 CHM）", 'success')
                 self._log(f"输出目录: {Path(op).resolve()}", 'info')
-                # 最终目录结构快照 (调试用，30分钟后自动清理)
-                try:
-                    dbg = TempFileManager.get()
-                    _dump_tree_snapshot(dbg, Path(op), '_final_tree.txt', max_depth=4)
-                except Exception:
-                    pass
             except Exception as e:
                 self._log(f"致命错误: {e}", 'error')
                 import traceback; self._log(traceback.format_exc(), 'error')
