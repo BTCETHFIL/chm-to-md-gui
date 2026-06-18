@@ -835,6 +835,15 @@ def _assign_toc_numbers(node, numbers=None):
             _assign_toc_numbers(child, child_numbers)
 
 
+def _prepend_book_number(node, book_num):
+    """在TOC树的所有编号前加上书序号，如 1.2 → 3.1.2（文件夹模式用）"""
+    for child in node.children:
+        if child.number:
+            child.number = f"{book_num}.{child.number}"
+        if child.children:
+            _prepend_book_number(child, book_num)
+
+
 def _toc_to_flat(node, prefix=''):
     """递归展开TOCNode树为扁平列表"""
     result = []
@@ -890,14 +899,15 @@ def _write_index(out_dir, title, entries, log):
 
 # ═══════════════════ Main Converter ═══════════════════
 
-def convert_chm(chm_path, out_root, log):
-    """Convert CHM -> structured Markdown with TOC, metadata, etc."""
+def convert_chm(chm_path, out_root, log, book_num=None):
+    """Convert CHM -> structured Markdown with TOC, metadata, etc.
+    book_num: 文件夹模式下的书序号，会加到所有编号前(如 1.2→3.1.2)和目录名前"""
     p = Path(chm_path)
     log(f"处理: {p.name}", 'info')
     log("-" * 50, 'info')
 
     md_converter = MDConverter()
-    base_dir = Path(out_root) / _safe_fn(p.stem)
+    base_dir = Path(out_root) / _safe_fn(f"{book_num:02d}_{p.stem}" if book_num else p.stem)
 
     # ── 初始化调试临时目录 (使用系统临时目录，30分钟自动清理) ──
     dbg = TempFileManager.get()
@@ -940,6 +950,8 @@ def convert_chm(chm_path, out_root, log):
             pass
         toc_root = toc_parser.parse(hhc_data)
         _assign_toc_numbers(toc_root)
+        if book_num is not None:
+            _prepend_book_number(toc_root, book_num)
         flat = _toc_to_flat(toc_root)
 
     # ── 处理合并引用 (merge) ──
@@ -983,6 +995,8 @@ def convert_chm(chm_path, out_root, log):
                     sub_parser = TOCParser()
                     sub_root = sub_parser.parse(sub_hhc)
                     _assign_toc_numbers(sub_root)
+                    if book_num is not None:
+                        _prepend_book_number(sub_root, book_num)
                     sub_flat = _toc_to_flat(sub_root)
                     # 重映射到 merge 节点下
                     clean_title = _clean_path(title)
@@ -1478,7 +1492,7 @@ class App:
                 self.iv.set(f"已选择 {len(paths)} 个文件")
         else:
             p = filedialog.askdirectory(title="选择包含 CHM 文件的文件夹")
-            if p: self.iv.set(p); self._files = [str(f) for f in Path(p).glob("*.chm")]
+            if p: self.iv.set(p); self._files = sorted(str(f) for f in Path(p).glob("*.chm"))
 
     def _bo(self):
         p = filedialog.askdirectory(title="选择输出目录")
@@ -1506,7 +1520,7 @@ class App:
         else:
             ip = self.iv.get().strip()
             if not ip: messagebox.showwarning("提示", "请选择一个文件夹！"); return
-            tasks = [str(f) for f in Path(ip).glob("*.chm")]
+            tasks = sorted(str(f) for f in Path(ip).glob("*.chm"))
             if not tasks:
                 messagebox.showwarning("提示", "文件夹中没有 .chm 文件"); return
 
@@ -1526,8 +1540,9 @@ class App:
                     self.r.after(0, lambda p=pct, t=f"{i+1}/{total}": (
                         self.pv.set(p), self.pl.config(text=t)))
                     try:
+                        bnum = (i + 1) if mode == 'folder' else None
                         n, out_dir = convert_chm(
-                            cf, op, lambda m, t='info': self._log(m, t))
+                            cf, op, lambda m, t='info': self._log(m, t), bnum)
                         count += n
                     except Exception as e:
                         self._log(f"失败: {Path(cf).name}: {e}", 'error')
