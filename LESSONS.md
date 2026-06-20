@@ -461,3 +461,25 @@ for f in self._cfg.__dataclass_fields__:
 - GUI 应当有视觉提示：勾选后爬取量可能翻倍，需和测试模式搭配使用
 
 *记录于 2026-06-18，最后更新于 2026-06-19*
+
+---
+
+## 26. Markdown 中 data:image/png;base64 超大单行会导致渲染失败
+
+**场景**：知乎爬虫截图从 1280×800 改为 1920×1080（含 `device_scale_factor: 2` Retina 渲染）后，单张截图产生近 80 万字符的 base64 字符串。嵌入在 `![screenshot](data:image/png;base64,AAAAAA...)` 这行时，部分 Markdown 渲染器（VS Code、GitHub、Typora 等）因单行过长无法解析，显示 "load image failed"。
+
+**修复**：
+1. 将截图从 base64 内嵌改为**独立 PNG 文件 + 相对路径引用**：
+   - `crawl_answer_combined` 返回 `screenshot_bytes`（原始 PNG 字节流）
+   - MD 中用 `![截图](./{answer_id}.png)` 引用
+   - `crawl_user_answers` 在同目录下保存 `{answer_id}.png`
+2. 缓存兼容：JSON 不支持 bytes，缓存时 `base64.b64encode` / 读取时 `base64.b64decode`
+3. 同步更新 `crawl_answer_screenshot`（死代码）保持返回键一致
+
+**教训**：
+- Markdown 的 `data:` URI 嵌入不适合大型二进制数据——单行长度超过几十万字符时几乎所有解析器都有问题
+- 截图应作为独立资源文件管理：可独立打开查看、不污染 MD 文件大小、支持增量备份
+- 缓存序列化时注意类型兼容：Python dict→JSON 需要 bytes→base64 转换，读取时反转
+- 输出结构需要预先考虑资源文件（PNG/JPG/HTML）的命名和引用方式，避免后期重构
+
+*记录于 2026-06-19*
