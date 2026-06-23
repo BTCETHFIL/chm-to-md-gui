@@ -35,6 +35,11 @@ try:
     HAS_REQUESTS = True
 except ImportError:
     HAS_REQUESTS = False
+try:
+    from playwright.sync_api import sync_playwright
+    HAS_PLAYWRIGHT = True
+except ImportError:
+    HAS_PLAYWRIGHT = False
 
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox, scrolledtext
@@ -247,6 +252,9 @@ class HTMLCleaner:
     """HTML清理器 — 移除无用标签/属性/注释，提取标题"""
     REMOVE_TAGS = ["script", "style", "nav", "footer", "iframe", "noscript", "object"]
     REMOVE_ATTRS = ["style", "class", "id", "onclick", "onload", "onmouseover"]
+    # 文档网站常见的导航/侧边栏容器（id/class 包含这些关键词则移除）
+    SIDEBAR_KEYWORDS = ["sidenav", "sideaffix", "sidetoc", "sidefilter",
+                        "toc-toggle", "navbar", "breadcrumb"]
 
     @classmethod
     def clean(cls, html_content):
@@ -265,6 +273,15 @@ class HTMLCleaner:
         for tag_name in cls.REMOVE_TAGS:
             for tag in soup.find_all(tag_name):
                 tag.decompose()
+        # 移除 anchorjs 空链接（生成无意义 [](<url>) 的元凶）
+        for a in soup.find_all('a', class_=lambda c: c and 'anchorjs' in ' '.join(c) if isinstance(c, list) else 'anchorjs' in str(c)):
+            a.decompose()
+        # 移除文档网站侧边栏/导航容器（避免导航链接混入正文）
+        for kw in cls.SIDEBAR_KEYWORDS:
+            for el in soup.find_all(attrs={'class': lambda c: c and kw in ' '.join(c) if isinstance(c, list) else kw in str(c)}):
+                el.decompose()
+            for el in soup.find_all(attrs={'id': lambda i: i and kw in str(i)}):
+                el.decompose()
         # 清理属性
         for tag in soup.find_all(True):
             for attr in cls.REMOVE_ATTRS:
@@ -492,7 +509,21 @@ def fix_markdown_links(markdown):
     markdown = re.sub(r'\]\(<?([^)>]+)\.html>?\)', fix_html_link, markdown)
     markdown = re.sub(r'\]\(<?([^)>]+)\.htm>?\)', fix_html_link, markdown)
 
-    # 2. 修复图片路径指向 assets/images/
+    # 2. 去除链接 URL 中不必要的尖括号包裹（html2text 对含特殊字符 URL 的保守处理）
+    #    [text](<url>) → [text](url) （URL 不含空格/未转义括号时是安全的）
+    def unwrap_url(m):
+        text = m.group(1) or ''
+        url = m.group(2)
+        if url.startswith('<') and url.endswith('>'):
+            url = url[1:-1]
+        # 跳过 data URI 和图片链接的修改（由 fix_image_path 处理）
+        if m.group(0).startswith('!['):
+            return f'![{text}]({url})'
+        return f'[{text}]({url})'
+
+    markdown = re.sub(r'\[([^\]]*)\]\(<?([^)>]+)>?\)', unwrap_url, markdown)
+
+    # 3. 修复图片路径指向 assets/images/
     def fix_image_path(m):
         alt_text = m.group(1) or ""
         img_path = m.group(2)
@@ -504,7 +535,7 @@ def fix_markdown_links(markdown):
 
     markdown = re.sub(r'!\[([^\]]*)\]\(([^)]+)\)', fix_image_path, markdown)
 
-    # 3. 移除HTML锚点链接
+    # 4. 移除HTML锚点链接
     markdown = re.sub(r'\]\(<#[^>]+>\)', '](#)', markdown)
 
     return markdown
@@ -644,13 +675,72 @@ class TOCParser:
                 self._parse_ul(child_ul, node, level + 1)
 
 
+# ═══════════════════ Companion Folder Detection ═══════════════════
+
+def _find_companion_folder(html_path):
+    """检测浏览器保存网页时生成的配套文件夹。
+
+    浏览器"另存为"网页时，生成的文件夹命名规则：
+      - Chrome/Edge/Firefox:  文件名_files/
+      - IE 旧版:              文件名.files/
+    返回 Path 对象或 None。
+    """
+    fp = Path(html_path)
+    # 尝试两种命名规则
+    for suffix in ['_files', '.files']:
+        candidate = fp.parent / (fp.stem + suffix)
+        if candidate.is_dir():
+            return candidate
+    # 有些浏览器可能用不同后缀，扫描同名前缀的目录
+    prefix = fp.stem
+    for item in fp.parent.iterdir():
+        if item.is_dir() and item.name.startswith(prefix) and item != fp:
+            # 检查是否像配套文件夹（包含常见网页资源文件）
+            for ext in ['.png', '.jpg', '.jpeg', '.gif', '.css', '.js', '.svg']:
+                if any(item.rglob(f'*{ext}')):
+                    return item
+    return None
+
+
+def _load_companion_images(folder, log=None):
+    """从配套文件夹加载所有图片，返回 {相对路径: bytes} 字典。
+
+    同时建立文件名索引（key 为纯文件名），方便按文件名匹配。
+    支持子目录中的图片。
+    """
+    def _log(msg, tag='info'):
+        if log: log(msg, tag)
+
+    img_exts = {'.png', '.jpg', '.jpeg', '.gif', '.bmp', '.svg', '.ico', '.webp'}
+    files_dict = {}
+    count = 0
+
+    for f in sorted(folder.rglob('*')):
+        if f.is_file() and f.suffix.lower() in img_exts:
+            try:
+                data = f.read_bytes()
+                if data:
+                    # 以相对于配套文件夹的路径为 key
+                    rel = str(f.relative_to(folder)).replace('\\', '/')
+                    files_dict[rel] = data
+                    # 也加纯文件名 key（兼容 HTML 中只用文件名的引用）
+                    files_dict[f.name] = data
+                    count += 1
+            except Exception:
+                pass
+
+    if count:
+        _log(f"从配套文件夹加载了 {count} 个图片文件", 'info')
+    return files_dict
+
+
 # ═══════════════════ MHTML / HTML / URL Input ═══════════════════
 
 def _parse_mhtml(filepath, log=None):
-    """解析 MHTML 文件，返回 (html_content, title)
+    """解析 MHTML 文件，返回 (html_content, title, images_dict)
 
     MHTML 是浏览器"另存为单个文件"的格式，MIME multipart/related 包裹。
-    提取第一个 text/html 部分，自动处理 quoted-printable/base64 编码。
+    提取 text/html 和所有内嵌图片（image/* MIME parts）。
     标题优先从 HTML <title> 提取，其次从 MIME Subject 头。
     """
     def _log(msg, tag='info'):
@@ -675,14 +765,15 @@ def _parse_mhtml(filepath, log=None):
         except Exception:
             mime_title = subject
 
-    # 提取 text/html 部分
+    # 提取 text/html 和图片
     html_body = None
+    images_dict = {}
+
     for part in msg.walk():
         ct = part.get_content_type()
-        if ct == 'text/html':
+        if ct == 'text/html' and html_body is None:
             payload = part.get_payload(decode=True)
             if payload:
-                # 尝试 UTF-8，失败则 latin-1
                 try:
                     html_body = payload.decode('utf-8')
                 except UnicodeDecodeError:
@@ -690,10 +781,33 @@ def _parse_mhtml(filepath, log=None):
                         html_body = payload.decode('gbk')
                     except UnicodeDecodeError:
                         html_body = payload.decode('latin-1')
-                break
+        elif ct.startswith('image/'):
+            # 提取内嵌图片
+            payload = part.get_payload(decode=True)
+            if payload:
+                cid = part.get('Content-ID', '').strip('<>')
+                cdl = part.get('Content-Location', '')
+                # 尝试从 Content-Type 确定文件扩展名
+                subtype = ct.split('/')[-1]
+                if subtype == 'jpeg':
+                    ext = '.jpg'
+                elif subtype == 'svg+xml':
+                    ext = '.svg'
+                else:
+                    ext = '.' + subtype
+                # 以 Content-Location 文件名或 Content-ID 为 key
+                name = cdl.split('/')[-1] if cdl else (cid + ext if cid else None)
+                if name and payload:
+                    images_dict[name] = payload
+                    # 也加纯文件名 key
+                    if '/' in cdl or '\\' in cdl:
+                        images_dict[Path(name).name] = payload
 
     if not html_body:
         raise ValueError("MHTML 文件中未找到 text/html 内容")
+
+    if images_dict:
+        _log(f"MHTML 内嵌图片: {len(images_dict)} 个", 'info')
 
     # 从 HTML <title> 提取标题
     soup = BeautifulSoup(html_body, 'html.parser')
@@ -703,7 +817,7 @@ def _parse_mhtml(filepath, log=None):
 
     title = html_title or mime_title or Path(filepath).stem
     _log(f"MHTML 标题: {title}", 'info')
-    return html_body, title
+    return html_body, title, images_dict
 
 
 def _read_html_file(filepath, log=None):
@@ -723,21 +837,30 @@ def _read_html_file(filepath, log=None):
 
 
 def _fetch_url(url, log=None):
-    """抓取网页 URL，返回 (html_content, title)"""
+    """抓取网页 URL，返回 (html_content, title, images_dict)
+
+    优先使用 Playwright 无头浏览器（完整 JS 渲染 + 图片下载），
+    未安装 Playwright 时回退到 requests（仅静态 HTML，无图片）。"""
     def _log(msg, tag='info'):
         if log: log(msg, tag)
 
+    if HAS_PLAYWRIGHT:
+        try:
+            return _fetch_url_headless(url, log)
+        except Exception as e:
+            _log(f"Playwright 抓取失败: {e}，回退到 requests 模式（可能丢失动态内容）", 'warn')
+            # 回退到 requests
+
+    # ── requests 回退模式 ──
     if HAS_REQUESTS:
         headers = {
             'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
         }
         resp = requests.get(url, headers=headers, timeout=30)
         resp.raise_for_status()
-        # 尝试从响应头获取编码
         if resp.encoding and resp.encoding.lower() != 'iso-8859-1':
             resp.encoding = resp.encoding
         else:
-            # 从 HTML 内容探测编码
             match = re.search(rb'charset=["\']?([a-zA-Z0-9\-]+)', resp.content[:4096])
             if match:
                 try:
@@ -752,7 +875,6 @@ def _fetch_url(url, log=None):
         })
         with urllib.request.urlopen(req, timeout=30) as resp:
             raw = resp.read()
-            # 检测编码
             encoding = resp.headers.get_content_charset()
             if not encoding:
                 match = re.search(rb'charset=["\']?([a-zA-Z0-9\-]+)', raw[:4096])
@@ -768,19 +890,804 @@ def _fetch_url(url, log=None):
         title = soup.title.string.strip()
     title = title or urlparse(url).netloc or 'webpage'
     _log(f"URL 标题: {title}", 'info')
-    return html, title
+    return html, title, {}
 
 
-def _html_to_md(html, title, out_dir, log=None):
+def _fetch_url_first_pass(url, log=None):
+    """URL 模式第一步：抓取首页并提取侧边栏导航结构。
+
+    返回 (html, title, images_dict, nav_entries)
+    nav_entries: [(section_text, section_url, level), ...]
+    """
+    def _log(msg, tag='info'):
+        if log:
+            log(msg, tag)
+
+    if not HAS_PLAYWRIGHT:
+        # 无 Playwright 时回退普通抓取，无导航信息
+        html, title, images_dict = _fetch_url(url, log)
+        return html, title, images_dict, []
+
+    try:
+        with sync_playwright() as p:
+            browser = p.chromium.launch(headless=True)
+            context = browser.new_context(
+                user_agent='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+            )
+            page = context.new_page()
+
+            try:
+                _log("启动无头浏览器 (Chromium)...", 'info')
+                _log(f"导航到: {url}", 'info')
+                page.goto(url, wait_until='networkidle', timeout=60000)
+                page.wait_for_timeout(2000)
+
+                html = page.content()
+                title = page.title() or urlparse(url).netloc or 'webpage'
+                _log(f"页面标题: {title}", 'info')
+
+                # 提取侧边栏导航
+                nav_entries = _extract_sidebar_links(page, url)
+                if nav_entries:
+                    _log(f"检测到侧边栏导航: {len(nav_entries)} 个链接", 'info')
+
+                # 下载图片
+                images_dict = {}
+                img_count = _download_page_images(page, context, images_dict)
+                if img_count:
+                    _log(f"首页图片: {img_count} 张", 'info')
+
+                return html, title, images_dict, nav_entries
+
+            finally:
+                browser.close()
+
+    except Exception as e:
+        _log(f"Playwright 抓取失败: {e}，回退到 requests 模式", 'warn')
+        html, title, images_dict = _fetch_url(url, log)
+        return html, title, images_dict, []
+
+
+def _fetch_url_headless(url, log=None):
+    """使用 Playwright 无头浏览器抓取网页，返回 (html, title, images_dict)
+
+    优势：完整执行 JavaScript（React/Vue/Angular 等 SPA 的内容都能拿到），
+         同时下载页面中所有图片并内嵌到输出 MD。
+    """
+    def _log(msg, tag='info'):
+        if log: log(msg, tag)
+
+    _log("启动无头浏览器 (Chromium)...", 'info')
+
+    with sync_playwright() as p:
+        browser = p.chromium.launch(headless=True)
+        context = browser.new_context(
+            user_agent='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+        )
+        page = context.new_page()
+
+        try:
+            # 导航到目标 URL
+            _log(f"导航到: {url}", 'info')
+            page.goto(url, wait_until='networkidle', timeout=60000)
+            # 额外等待以确保 JS 渲染完成（特别是懒加载内容）
+            page.wait_for_timeout(2000)
+
+            # 获取完整渲染后的 HTML
+            html = page.content()
+            title = page.title() or urlparse(url).netloc or 'webpage'
+            _log(f"页面标题: {title}", 'info')
+
+            # ── 下载页面中的所有图片 ──
+            images_dict = {}
+            img_count = 0
+            img_ext_to_mime = {
+                'png': 'image/png', 'jpg': 'image/jpeg', 'jpeg': 'image/jpeg',
+                'gif': 'image/gif', 'bmp': 'image/bmp', 'svg': 'image/svg+xml',
+                'ico': 'image/x-icon', 'webp': 'image/webp'
+            }
+            img_exts = {'.png', '.jpg', '.jpeg', '.gif', '.bmp', '.svg', '.ico', '.webp'}
+
+            # 从渲染后的 DOM 提取所有 img 元素信息
+            img_elements = page.evaluate('''() => {
+                const imgs = document.querySelectorAll('img');
+                return Array.from(imgs).map(img => ({
+                    src: img.src || img.getAttribute('src') || '',
+                    currentSrc: img.currentSrc || '',
+                    datasetSrc: img.dataset?.src || ''
+                }));
+            }''')
+
+            for entry in img_elements:
+                # 取最优 src（currentSrc > src > data-src）
+                src = entry['currentSrc'] or entry['src'] or entry['datasetSrc']
+                if not src or src.startswith('data:'):
+                    continue  # 跳过空链接和已内嵌的
+
+                # 构建相对路径作为 key（从 URL 中提取路径部分）
+                try:
+                    parsed = urlparse(src)
+                    path_part = unquote(parsed.path).lstrip('/')
+                    if not path_part:
+                        continue
+                    # key: 纯文件名 + 相对路径
+                    fname = path_part.rsplit('/', 1)[-1] if '/' in path_part else path_part
+                    ext = Path(fname).suffix.lower()
+                    if ext not in img_exts:
+                        continue
+                except Exception:
+                    continue
+
+                if fname in images_dict:
+                    continue  # 已下载
+
+                # 通过 browser context 下载图片（复用 cookie/session）
+                try:
+                    img_resp = context.request.get(src, timeout=15000)
+                    if img_resp and img_resp.ok:
+                        data = img_resp.body()
+                        if data:
+                            images_dict[fname] = data
+                            if path_part != fname:
+                                images_dict[path_part] = data
+                            img_count += 1
+                except Exception:
+                    pass  # 个别图片下载失败不中断整体流程
+
+            if img_count:
+                _log(f"已下载 {img_count} 张图片", 'info')
+
+            return html, title, images_dict
+
+        finally:
+            browser.close()
+
+
+# ──────────────────────────────────────────────
+#  多页整站爬取
+# ──────────────────────────────────────────────
+
+def _extract_sidebar_links(page, base_url):
+    """从已渲染的 Playwright 页面提取侧边栏导航链接。
+
+    返回 [(text, href, level), ...]
+    level: 1=顶层章节, 2=子章节, ...
+    仅保留同域名、非锚点、非 javascript: 的有效链接，已去重。
+    """
+    entries = page.evaluate('''() => {
+        // 优先匹配常见文档站侧边栏结构
+        const selectors = [
+            '#sidetoc a', '.sidetoc a',
+            '#sidenav a', '.sidenav a',
+            'nav.sidebar a', 'aside.sidebar a',
+            '.sidebar a.toc-link',
+            '[role="navigation"] a[href]',
+            'nav a[href]', 'aside a[href]',
+            '.toc a', '#toc a'
+        ];
+        let best = [];
+        for (const sel of selectors) {
+            const nodes = document.querySelectorAll(sel);
+            if (nodes.length >= 5) {
+                best = Array.from(nodes).map(a => {
+                    // 计算嵌套层级
+                    let level = 1;
+                    let el = a.closest('li');
+                    if (el) {
+                        // 统计祖先 li 的数量
+                        let p = el.parentElement;
+                        while (p) {
+                            if (p.tagName === 'LI') level++;
+                            p = p.parentElement;
+                        }
+                    }
+                    return {
+                        text: (a.textContent || '').trim().replace(/\\s+/g, ' '),
+                        href: a.href || a.getAttribute('href') || '',
+                        level: Math.min(level, 4)
+                    };
+                }).filter(e => e.text && e.href);
+                break;
+            }
+        }
+        return best;
+    }''')
+
+    base_parsed = urlparse(base_url)
+    base_domain = base_parsed.netloc
+    base_path = base_parsed.path.rsplit('/', 1)[0] if '/' in base_parsed.path else ''
+
+    seen_hrefs = set()
+    result = []
+
+    for entry in entries:
+        href = entry['href']
+        text = entry['text']
+        if not href or not text:
+            continue
+        # 过滤锚点、javascript、mailto
+        if href.startswith('#') or href.startswith('javascript:') or href.startswith('mailto:'):
+            continue
+
+        # 转为绝对 URL
+        parsed = urlparse(href)
+        if not parsed.netloc:
+            # 相对路径
+            if href.startswith('/'):
+                href = f"{base_parsed.scheme}://{base_domain}{href}"
+            else:
+                href = f"{base_parsed.scheme}://{base_domain}{base_path}/{href}"
+
+        parsed = urlparse(href)
+        # 仅保留同域名
+        if parsed.netloc != base_domain:
+            continue
+        # 去重（同一 URL 只保留第一次出现的标题）
+        if href in seen_hrefs:
+            continue
+        seen_hrefs.add(href)
+
+        result.append((text, href, entry.get('level', 1)))
+
+    return result
+
+
+def _extract_main_content(html):
+    """从页面 HTML 中提取主内容区域，去除页眉/侧边栏/页脚。"""
+    soup = BeautifulSoup(html, 'html.parser')
+
+    # 移除不需要的元素
+    remove_selectors = [
+        'nav', 'footer',
+        '#sidenav', '#sideaffix', '#sidetoc', '#sidefilter',
+        '#navbar', '#breadcrumb', '#toc',
+        '.sidenav', '.sideaffix', '.sidetoc', '.sidefilter',
+        '.navbar', '.breadcrumb', '.toc', '.sidebar',
+        '[role="navigation"]',
+        'script', 'style', 'noscript',
+    ]
+    for sel in remove_selectors:
+        for el in soup.select(sel):
+            el.decompose()
+
+    # 尝试提取主内容区域
+    content_selectors = [
+        'article', 'main',
+        '.markdown-body', '.content', '#content',
+        '.article-content', '.post-content', '.page-content',
+        '.main-content', '#main-content',
+        '.doc-content', '#doc-content',
+        '.body-content', '#body-content',
+    ]
+    for sel in content_selectors:
+        content = soup.select_one(sel)
+        if content:
+            return str(content)
+
+    # 回退：直接返回 body 内容
+    body = soup.find('body')
+    return str(body) if body else html
+
+
+def _crawl_multi_page(start_url, log=None, nav_entries=None,
+                      site_title='', existing_images=None):
+    """整站爬取：从起始页提取导航，逐一抓取所有子页面，合并内容。
+
+    参数:
+        start_url: 起始 URL
+        log: 日志回调
+        nav_entries: 可选的已有导航 [(text, href, level), ...]，
+                    若提供则跳过导航提取步骤
+        site_title: 可选，若提供且 nav_entries 也提供则跳过首页加载
+        existing_images: 可选，首轮已下载的图片，传入则增量追加
+
+    返回 (site_title, page_data_list, combined_images, site_structure)
+    page_data_list: [(chapter_num, section_title, section_url, main_html), ...]
+    site_structure: [(section_title, page_url, [(h_level, h_text), ...]), ...]
+    """
+    def _log(msg, tag='info'):
+        if log:
+            log(msg, tag)
+
+    base_parsed = urlparse(start_url)
+    base_domain = base_parsed.netloc
+
+    _log("=" * 50, 'info')
+    _log("整站爬取模式", 'info')
+    _log(f"起始 URL: {start_url}", 'info')
+
+    combined_images = existing_images if existing_images else {}
+
+    with sync_playwright() as p:
+        browser = p.chromium.launch(headless=True)
+        context = browser.new_context(
+            user_agent='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+        )
+
+        try:
+            # ── Step 1: 抓取首页 + 提取导航（或使用传入的已有导航） ──
+            if nav_entries:
+                _log(f"使用已提取的导航: {len(nav_entries)} 个链接", 'info')
+            else:
+                _log("正在加载首页...", 'info')
+                page0 = context.new_page()
+                try:
+                    page0.goto(start_url, wait_until='networkidle', timeout=60000)
+                    page0.wait_for_timeout(2000)
+                    nav_entries = _extract_sidebar_links(page0, start_url)
+                finally:
+                    page0.close()
+
+            if nav_entries:
+                _log(f"导航共 {len(nav_entries)} 个链接", 'info')
+            else:
+                _log("未检测到多页导航结构，将以单页模式处理", 'info')
+                page0 = context.new_page()
+                try:
+                    page0.goto(start_url, wait_until='networkidle', timeout=60000)
+                    page0.wait_for_timeout(2000)
+                    first_html = page0.content()
+                    site_title = page0.title() or base_domain
+                    first_images = _download_page_images(page0, context, combined_images)
+                    _log(f"首页图片: {first_images} 张", 'info')
+                finally:
+                    page0.close()
+                browser.close()
+                headings = _extract_headings(first_html)
+                page_data = [('1', site_title, start_url, first_html)]
+                return site_title, page_data, combined_images, [(site_title, start_url, headings)]
+
+            # ── Step 2: 获取站点标题及首页图片 ──
+            if site_title and existing_images is not None:
+                # 调用方已提供标题和图片，跳过首页加载
+                _log(f"站点标题: {site_title}（重用首轮抓取结果）", 'info')
+            else:
+                site_title = base_domain  # 默认值
+                page = context.new_page()
+                try:
+                    page.goto(start_url, wait_until='networkidle', timeout=60000)
+                    page.wait_for_timeout(2000)
+                    site_title = page.title() or base_domain
+                    _log(f"站点标题: {site_title}", 'info')
+                    # 下载首页图片
+                    first_images = _download_page_images(page, context, combined_images)
+                    if first_images:
+                        _log(f"首页图片: {first_images} 张", 'info')
+                finally:
+                    page.close()
+
+            # ── Step 3: 逐页抓取 ──
+            total = len(nav_entries)
+            chapter_nums = _generate_chapter_numbers(nav_entries)
+            page_data_list = []  # [(chapter_num, section_text, section_url, main_html), ...]
+            site_structure = []  # [(section_text, page_url, [(h_level, h_text)]), ...]
+
+            for idx, (section_text, section_url, level) in enumerate(nav_entries):
+                chapter_num = chapter_nums[idx]
+                pct = int((idx + 1) / total * 100) if total else 100
+                _log(f"[{idx + 1}/{total}] {chapter_num} {section_text} ({pct}%)", 'info')
+
+                sp = None
+                try:
+                    sp = context.new_page()
+                    sp.goto(section_url, wait_until='networkidle', timeout=45000)
+                    sp.wait_for_timeout(1500)
+
+                    page_html = sp.content()
+                    page_headings = _extract_headings(page_html)
+                    page_images = _download_page_images(sp, context, combined_images)
+                    if page_images:
+                        _log(f"  └ 图片: {page_images} 张", 'debug')
+
+                    # 提取主内容
+                    main_html = _extract_main_content(page_html)
+                    page_data_list.append((chapter_num, section_text, section_url, main_html))
+                    site_structure.append((section_text, section_url, page_headings))
+
+                except Exception as e:
+                    _log(f"  └ 抓取失败: {e}", 'warn')
+                    # 失败页面也占位，保持编号对应
+                    page_data_list.append((chapter_num, section_text, section_url, ''))
+                    site_structure.append((section_text, section_url, []))
+                finally:
+                    if sp is not None:
+                        try:
+                            sp.close()
+                        except Exception:
+                            pass
+
+            browser.close()
+
+            # ── Step 4: 汇总 ──
+            success_count = sum(1 for _, _, _, html in page_data_list if html)
+            _log(f"爬取完成: {success_count}/{total} 页成功, {len(combined_images)} 张图片", 'success')
+
+            return site_title, page_data_list, combined_images, site_structure
+
+        except Exception as e:
+            try:
+                browser.close()
+            except Exception:
+                pass
+            raise
+
+
+def _escape_html(text):
+    """HTML 转义文本中的特殊字符"""
+    return text.replace('&', '&amp;').replace('<', '&lt;').replace('>', '&gt;').replace('"', '&quot;')
+
+
+def _generate_chapter_numbers(nav_entries):
+    """根据侧边栏层级生成章节编号列表。
+
+    nav_entries: [(text, url, level), ...]   level 从 1 开始（顶层）
+    返回: ["1", "1.1", "1.2", "2", "2.1", ...]
+
+    示例:
+        level=1 → counters=[1] → "1"
+        level=2 → counters=[1,1] → "1.1"
+        level=2 → counters=[1,2] → "1.2"
+        level=1 → counters=[2] → "2"
+    """
+    counters = []  # 各层级当前计数
+    result = []
+    for _, _, level in nav_entries:
+        lv = max(1, level)
+        # 扩展或裁剪 counters 到当前层级
+        while len(counters) < lv:
+            counters.append(1)
+        counters = counters[:lv]
+        # 递增当前层计数器
+        counters[-1] += 1
+        # 生成编号字符串
+        result.append('.'.join(str(c) for c in counters))
+    return result
+
+
+def _derive_site_folder_name(title, nav_entries, url=''):
+    """从页面标题和导航条目推导站点文件夹名。
+
+    优先级：
+    1. nav_entries 中第一个 level=1 条目文本（通常是章节根标题，最可靠）
+    2. 清理 page.title() 中 "| SiteName"、" - SiteName" 等污染后缀
+    3. URL 域名兜底
+
+    典型场景：page.title()=" | 客户端软件文档" 无页面名，
+    但侧边栏第一条是 "客户端软件操作指南" → 返回后者。
+    """
+    # 1. 侧边栏第一级条目（最可靠）
+    if nav_entries:
+        for text, _, level in nav_entries:
+            if level == 1 and text:
+                return text.strip()
+
+    # 2. 清理 title 污染后缀（"页面名 | 网站名" → "页面名"）
+    if title:
+        for sep in (' | ', ' - ', ' — '):
+            if sep in title:
+                first_part = title.split(sep)[0].strip()
+                if first_part:
+                    return first_part
+        # 无分隔符，去除首尾分隔符残留后返回
+        clean = title.strip('| -— \t')
+        if clean:
+            return clean
+
+    # 3. 域名兜底
+    if url:
+        from urllib.parse import urlparse
+        return urlparse(url).netloc or 'site'
+    return 'site'
+
+
+def _download_page_images(page, context, images_dict):
+    """从 Playwright 页面下载所有图片到 images_dict（原地修改），返回下载数量。"""
+    img_exts = {'.png', '.jpg', '.jpeg', '.gif', '.bmp', '.svg', '.ico', '.webp'}
+    img_count = 0
+
+    img_elements = page.evaluate('''() => {
+        const imgs = document.querySelectorAll('img');
+        return Array.from(imgs).map(img => ({
+            src: img.src || img.getAttribute('src') || '',
+            currentSrc: img.currentSrc || '',
+            datasetSrc: img.dataset?.src || ''
+        }));
+    }''')
+
+    for entry in img_elements:
+        src = entry['currentSrc'] or entry['src'] or entry['datasetSrc']
+        if not src or src.startswith('data:'):
+            continue
+        try:
+            parsed = urlparse(src)
+            path_part = unquote(parsed.path).lstrip('/')
+            if not path_part:
+                continue
+            fname = path_part.rsplit('/', 1)[-1] if '/' in path_part else path_part
+            ext = Path(fname).suffix.lower()
+            if ext not in img_exts:
+                continue
+        except Exception:
+            continue
+
+        if fname in images_dict:
+            continue
+
+        try:
+            img_resp = context.request.get(src, timeout=15000)
+            if img_resp and img_resp.ok:
+                data = img_resp.body()
+                if data:
+                    images_dict[fname] = data
+                    if path_part != fname:
+                        images_dict[path_part] = data
+                    img_count += 1
+        except Exception:
+            pass
+
+    return img_count
+
+
+def _extract_headings(html):
+    """从 HTML 提取标题结构，返回 [(level, text), ...]
+
+    level 为 1-6（对应 h1-h6），已过滤空白标题和侧边栏内的标题。
+    用于 URL 模式转换前预览页面结构。
+    """
+    soup = BeautifulSoup(html, 'html.parser')
+
+    # 移除已知侧边栏/导航容器（避免导航链接标题混入结构预览）
+    sidebar_ids = {'sidenav', 'sideaffix', 'sidetoc', 'sidefilter',
+                   'toc-toggle', 'navbar', 'breadcrumb', 'toc'}
+    for sid in sidebar_ids:
+        for el in soup.find_all(id=sid):
+            el.decompose()
+        for el in soup.find_all(class_=lambda c: c and sid in ' '.join(c) if isinstance(c, list) else sid in str(c)):
+            el.decompose()
+    # 也移除 nav/footer 内的标题
+    for tag_name in ['nav', 'footer']:
+        for el in soup.find_all(tag_name):
+            el.decompose()
+
+    headings = []
+    for tag in soup.find_all(['h1', 'h2', 'h3', 'h4', 'h5', 'h6']):
+        text = tag.get_text(strip=True)
+        if not text:
+            continue
+        level = int(tag.name[1])
+        headings.append((level, text))
+
+    return headings
+
+
+class URLPreviewDialog:
+    """URL 抓取内容预览对话框 — 支持单页和多页整站结构预览"""
+
+    def __init__(self, parent, url, title, headings_or_site, img_count, html_len):
+        """
+        参数:
+            headings_or_site:
+                - 单页模式: [(level, text), ...]  = 旧格式
+                - 整站模式: [(section_title, section_url, [(level, text), ...]), ...]
+        """
+        self.result = False
+        self.site_structure = None  # 整站模式
+        self.headings = None        # 单页模式
+
+        # 判断模式
+        if headings_or_site and isinstance(headings_or_site[0], (list, tuple)):
+            first = headings_or_site[0]
+            if len(first) >= 3 and isinstance(first[0], str) and isinstance(first[1], str):
+                # 三元组 (title, url, headings) → 整站模式
+                self.site_structure = headings_or_site
+            else:
+                # 二元组 (level, text) → 单页模式
+                self.headings = headings_or_site
+        else:
+            self.headings = headings_or_site if headings_or_site else []
+
+        is_multi = self.site_structure is not None
+        total_pages = len(self.site_structure) if is_multi else 1
+        total_headings = (
+            sum(len(entry[2]) for entry in self.site_structure)
+            if is_multi else (len(self.headings) if self.headings else 0)
+        )
+
+        # ── 窗口 ──
+        self.top = tk.Toplevel(parent)
+        mode_label = "整站爬取预览" if is_multi else "网页内容预览"
+        self.top.title(mode_label)
+        self.top.geometry("780x560" if is_multi else "680x520")
+        self.top.resizable(True, True)
+        self.top.transient(parent)
+        self.top.grab_set()
+
+        # ── 顶部信息栏 ──
+        info_frame = ttk.Frame(self.top, padding=(15, 10))
+        info_frame.pack(fill='x')
+
+        ttk.Label(info_frame, text=f"站点: {title[:80]}",
+                  font=('Microsoft YaHei', 11, 'bold')).pack(anchor='w')
+        ttk.Label(info_frame, text=f"URL: {url[:100]}",
+                  font=('Microsoft YaHei', 8), foreground='gray').pack(anchor='w', pady=(2, 0))
+
+        stats_frame = ttk.Frame(info_frame)
+        stats_frame.pack(fill='x', pady=(8, 0))
+
+        if is_multi:
+            stats_text = (
+                f"章节: {total_pages} 页  ·  "
+                f"标题节点: {total_headings} 个  ·  "
+                f"图片: {img_count} 张  ·  "
+                f"HTML: {html_len / 1024:.1f} KB"
+            )
+        else:
+            stats_text = (
+                f"标题节点: {total_headings} 个  ·  "
+                f"图片: {img_count} 张  ·  "
+                f"HTML 大小: {html_len / 1024:.1f} KB"
+            )
+        ttk.Label(stats_frame, text=stats_text,
+                  font=('Microsoft YaHei', 9)).pack(side='left')
+
+        ttk.Separator(self.top, orient='horizontal').pack(fill='x', padx=15)
+
+        # ── 底部按钮（先创建，确保始终可见） ──
+        btn_frame = ttk.Frame(self.top, padding=(15, 10))
+        btn_frame.pack(side='bottom', fill='x')
+
+        confirm_text = "确认整站转换 ->" if (is_multi and total_pages > 1) else "确认转换 ->"
+        warning = (
+            f"将依次抓取 {total_pages} 个页面，分章节保存为独立 Markdown 文件，"
+            f"并生成 _目录.md 索引。请确认结构无误。"
+            if is_multi and total_pages > 1
+            else "请检查以上内容结构是否完整正确，再决定是否转换。"
+        )
+        ttk.Label(btn_frame, text=warning,
+                  font=('Microsoft YaHei', 8), foreground='#666').pack(side='left')
+
+        self.btn_cancel = ttk.Button(btn_frame, text="取消", command=self._on_cancel)
+        self.btn_cancel.pack(side='right', padx=(5, 0))
+
+        self.btn_ok = ttk.Button(btn_frame, text=confirm_text, command=self._on_confirm)
+        self.btn_ok.pack(side='right')
+
+        # ── 树形预览区 ──
+        tree_frame = ttk.Frame(self.top, padding=(15, 5))
+        tree_frame.pack(side='top', fill='both', expand=True)
+
+        hint = "整站结构预览（侧边栏导航 -> 各页标题）：" if is_multi else "页面结构预览（抓取自渲染后 DOM）："
+        ttk.Label(tree_frame, text=hint,
+                  font=('Microsoft YaHei', 9)).pack(anchor='w')
+
+        tree_container = ttk.Frame(tree_frame)
+        tree_container.pack(fill='both', expand=True, pady=(5, 0))
+
+        tree_height = 20 if is_multi else 18
+        self.tree = ttk.Treeview(tree_container, columns=('text',), show='tree',
+                                  selectmode='none', height=tree_height)
+        self.tree.pack(side='left', fill='both', expand=True)
+
+        vsb = ttk.Scrollbar(tree_container, orient='vertical', command=self.tree.yview)
+        vsb.pack(side='right', fill='y')
+        self.tree.configure(yscrollcommand=vsb.set)
+
+        # 填充树节点（异常不影响按钮功能）
+        try:
+            if is_multi:
+                self._populate_site_tree()
+            else:
+                self._populate_tree(self.headings)
+        except Exception:
+            import traceback
+            self.tree.insert('', 'end', text=f'(预览构建失败: {traceback.format_exc()[:200]})', 
+                           values=('错误',))
+
+        # 绑定关闭事件
+        self.top.protocol('WM_DELETE_WINDOW', self._on_cancel)
+
+        # 居中
+        self.top.update_idletasks()
+        x = parent.winfo_rootx() + (parent.winfo_width() - self.top.winfo_width()) // 2
+        y = parent.winfo_rooty() + (parent.winfo_height() - self.top.winfo_height()) // 2
+        self.top.geometry(f'+{max(0,x)}+{max(0,y)}')
+
+    def _populate_site_tree(self):
+        """整站模式：显示侧边栏导航 -> 每页内部标题"""
+        if not self.site_structure:
+            self.tree.insert('', 'end', text='(无章节)', values=('未检测到导航结构',))
+            return
+
+        for idx, (sec_title, sec_url, page_headings) in enumerate(self.site_structure):
+            display_title = sec_title[:80] + '...' if len(sec_title) > 80 else sec_title
+            sec_iid = self.tree.insert(
+                '', 'end',
+                text=f'[{idx+1}] {display_title}',
+                values=(f'{idx + 1}. {sec_title}',),
+                open=False
+            )
+
+            if page_headings:
+                for level, h_text in page_headings:
+                    display_text = h_text[:90] + '...' if len(h_text) > 90 else h_text
+                    tag = f'H{level}'
+                    indent = '  ' * (level - 1)
+                    self.tree.insert(
+                        sec_iid, 'end',
+                        text=f'{indent}[{tag}] {display_text}',
+                        values=(h_text,)
+                    )
+            else:
+                self.tree.insert(
+                    sec_iid, 'end',
+                    text='  (正文无标题)',
+                    values=('该页未检测到 h1-h6 标题',)
+                )
+
+    def _populate_tree(self, headings):
+        """单页模式：将标题列表填充为树形结构"""
+        if not headings:
+            self.tree.insert('', 'end', text='(无标题)', values=('(页面没有检测到 h1-h6 标题)',))
+            return
+
+        stack = [('',)]  # stack[0] = 根
+
+        for level, text in headings:
+            display_text = text[:100] + '…' if len(text) > 100 else text
+            tag = f'H{level}'
+
+            while len(stack) <= level:
+                stack.append(('',))
+
+            stack = stack[:level + 1]
+
+            parent = ''
+            if level > 1 and len(stack) >= level:
+                parent = stack[level - 1][0] if stack[level - 1][0] else ''
+
+            iid = self.tree.insert(parent, 'end', text=f'[{tag}] {display_text}',
+                                    values=(display_text,))
+
+            if parent:
+                self.tree.item(parent, open=True)
+
+            stack[level] = (iid,)
+
+    def _on_confirm(self):
+        self.result = True
+        self.top.destroy()
+
+    def _on_cancel(self):
+        self.result = False
+        self.top.destroy()
+
+    def wait(self):
+        """阻塞等待用户选择（在主线程中运行）"""
+        self.top.wait_window()
+        return self.result
+
+
+def _html_to_md(html, title, out_dir, log=None, files_dict=None, basename=None):
     """将 HTML 内容转换为 Markdown 文件，保存到 out_dir
 
     返回生成的 .md 文件路径。
     复用现有的 HTMLCleaner + MDConverter + fix_markdown_links 引擎。
+
+    files_dict: 可选，{文件名/路径: bytes} 的图片字典。
+                传入后会调用 _embed_images() 将图片以 base64 内嵌到输出 MD。
+    basename:    可选，自定义输出文件名（不含扩展名），
+                传入时优先使用此名而非从 title 推导。
     """
     def _log(msg, tag='info'):
         if log: log(msg, tag)
 
     _log(f"处理: {title}", 'info')
+
+    # 如果提供了图片字典，先嵌入图片（base64），再清理/转换
+    # 注意：必须先 embed 再 clean，否则 clean 可能移除了 img 标签
+    if files_dict:
+        html = _embed_images(html, files_dict)
+        _log("图片已内嵌为 base64", 'info')
 
     # 清理 HTML
     cleaner = HTMLCleaner()
@@ -790,11 +1697,14 @@ def _html_to_md(html, title, out_dir, log=None):
     conv = MDConverter()
     md = conv.convert(cleaned)
 
-    # 修复链接
+    # 修复链接（已内嵌的 data: URI 会被 fix_markdown_links 跳过）
     md = fix_markdown_links(md)
 
     # 写入文件
-    fn = _clean_path(title) or 'index'
+    if basename:
+        fn = _clean_path(basename)
+    else:
+        fn = _clean_path(title) or 'index'
     if not fn.endswith('.md'):
         fn += '.md'
     out_path = Path(out_dir) / fn
@@ -1714,8 +2624,18 @@ class App:
         if p: self.ov.set(p)
 
     def _log(self, t, tag='info'):
-        self.log.insert('end', t + '\n', tag); self.log.see('end')
-        self.r.update_idletasks()
+        """线程安全的日志输出。"""
+        def _update():
+            try:
+                self.log.insert('end', t + '\n', tag)
+                self.log.see('end')
+            except Exception:
+                pass  # 窗口已销毁时静默忽略
+        # 在主线程执行 UI 更新（线程安全）
+        try:
+            self.r.after(0, _update)
+        except Exception:
+            pass  # root 已销毁时静默忽略
 
     def _start(self):
         op = self.ov.get().strip()
@@ -1811,32 +2731,147 @@ class App:
                     self._log(f"输入: HTML 文件 ({Path(tasks[0]).name})", 'info')
                     self.r.after(0, lambda: self.pv.set(20))
                     html, title = _read_html_file(tasks[0], lambda m, t='info': self._log(m, t))
+                    # 检测浏览器保存的配套文件夹，加载图片
+                    files_dict = {}
+                    companion = _find_companion_folder(tasks[0])
+                    if companion:
+                        self._log(f"检测到配套文件夹: {companion.name}", 'info')
+                        files_dict = _load_companion_images(companion,
+                            lambda m, t='info': self._log(m, t))
                     self.r.after(0, lambda: self.pv.set(50))
-                    _html_to_md(html, title, op, lambda m, t='info': self._log(m, t))
+                    _html_to_md(html, title, op, lambda m, t='info': self._log(m, t),
+                              files_dict=files_dict if files_dict else None)
                     self.r.after(0, lambda: (self.pv.set(100), self.pl.config(text="完成！")))
                     self._log(f"\nHTML → Markdown 转换完成", 'success')
 
                 elif input_type == 'mhtml':
                     self._log(f"输入: MHTML 文件 ({Path(tasks[0]).name})", 'info')
                     self.r.after(0, lambda: self.pv.set(20))
-                    html, title = _parse_mhtml(tasks[0], lambda m, t='info': self._log(m, t))
+                    html, title, images_dict = _parse_mhtml(tasks[0], lambda m, t='info': self._log(m, t))
                     self.r.after(0, lambda: self.pv.set(50))
-                    _html_to_md(html, title, op, lambda m, t='info': self._log(m, t))
+                    _html_to_md(html, title, op, lambda m, t='info': self._log(m, t),
+                              files_dict=images_dict if images_dict else None)
                     self.r.after(0, lambda: (self.pv.set(100), self.pl.config(text="完成！")))
                     self._log(f"\nMHTML → Markdown 转换完成", 'success')
 
                 elif input_type == 'url':
-                    self._log(f"输入: URL ({tasks[0]})", 'info')
-                    self.r.after(0, lambda: (self.pv.set(10), self.pl.config(text="正在抓取网页...")))
-                    html, title = _fetch_url(tasks[0], lambda m, t='info': self._log(m, t))
-                    self.r.after(0, lambda: self.pv.set(50))
-                    _html_to_md(html, title, op, lambda m, t='info': self._log(m, t))
+                    url = tasks[0]
+                    self._log(f"输入: URL ({url})", 'info')
+                    self.r.after(0, lambda: (self.pv.set(5), self.pl.config(text="正在抓取网页...")))
+
+                    # ── Step 1: 首轮抓取（首页 + 侧边栏导航提取） ──
+                    html, title, images_dict, nav_entries = _fetch_url_first_pass(
+                        url, lambda m, t='info': self._log(m, t)
+                    )
+
+                    # 推导站点文件夹名（侧边栏根条目优先，比 page.title() 可靠）
+                    site_folder_name = _derive_site_folder_name(title, nav_entries, url)
+
+                    is_multi = len(nav_entries) >= 3  # 3+ 链接视为多页站点
+
+                    # ── Step 2: 预览 ──
+                    if is_multi:
+                        # 整站预览：显示侧边栏导航结构（不含每页内部标题，需爬取后才有）
+                        preview_site = [(text, href, []) for (text, href, _) in nav_entries]
+                        self._log(f"检测到整站结构: {len(nav_entries)} 个章节", 'info')
+                    else:
+                        # 单页预览
+                        headings = _extract_headings(html)
+
+                    preview_event = threading.Event()
+                    preview_result = [False]
+                    preview_error = [None]
+
+                    def show_preview():
+                        try:
+                            preview_data = preview_site if is_multi else headings
+                            dlg = URLPreviewDialog(
+                                self.r, url, title, preview_data,
+                                len(images_dict), len(html)
+                            )
+                            preview_result[0] = dlg.wait()
+                        except Exception as e:
+                            preview_error[0] = e
+                            import traceback
+                            preview_error[0] = f"{e}\n{traceback.format_exc()}"
+                        finally:
+                            preview_event.set()
+
+                    self.r.after(0, show_preview)
+                    # 超时 120 秒，防止因 tk 嵌套事件循环异常导致永久阻塞
+                    if not preview_event.wait(timeout=120):
+                        self._log("预览窗口超时（120s），跳过预览继续转换", 'warn')
+                    if preview_error[0]:
+                        self._log(f"预览窗口创建失败: {preview_error[0]}", 'error')
+                        # 预览失败不阻止转换，继续执行
+                        preview_result[0] = True
+
+                    if not preview_result[0]:
+                        self._log("用户取消了转换", 'info')
+                        self.r.after(0, lambda: (self.pv.set(0), self.pl.config(text="已取消")))
+                        return
+
+                    # ── Step 3: 整站爬取 或 单页转换 ──
+                    if is_multi:
+                        self._log(f"开始整站爬取 ({len(nav_entries)} 个页面)...", 'info')
+                        self.r.after(0, lambda: (self.pv.set(10), self.pl.config(text="正在爬取所有页面...")))
+
+                        site_title_new, page_data_list, combined_images, site_structure = \
+                            _crawl_multi_page(url, lambda m, t='info': self._log(m, t),
+                                            nav_entries=nav_entries,
+                                            site_title=site_folder_name,
+                                            existing_images=images_dict)
+
+                        # 创建站点子目录
+                        site_dir = Path(op) / _clean_path(site_title_new or 'site')
+                        site_dir.mkdir(parents=True, exist_ok=True)
+
+                        # 逐页转换保存
+                        total_pages = len(page_data_list)
+                        self.r.after(0, lambda: (self.pv.set(50),
+                            self.pl.config(text=f"正在转换 {total_pages} 个页面...")))
+
+                        toc_lines = [f"# {site_title_new}\n"]
+                        saved_count = 0
+                        for i, (chapter_num, section_text, section_url, page_html) in enumerate(page_data_list):
+                            sub_pct = 50 + 45 * i // total_pages if total_pages else 95
+                            self.r.after(0, lambda p=sub_pct: self.pv.set(p))
+
+                            if not page_html:
+                                self._log(f"  ! 跳过空内容: {chapter_num} {section_text}", 'warn')
+                                toc_lines.append(
+                                    f"- {chapter_num} {section_text} *(抓取失败)*")
+                                continue
+
+                            filename = f"{chapter_num} {section_text}"
+                            _html_to_md(page_html, section_text, str(site_dir),
+                                       lambda m, t='info': self._log(m, t),
+                                       files_dict=combined_images if combined_images else None,
+                                       basename=filename)
+                            toc_lines.append(
+                                f"- [{chapter_num} {section_text}]({filename}.md)")
+                            saved_count += 1
+
+                        # 生成目录索引文件
+                        if saved_count:
+                            self._log(f"已保存 {saved_count} 个章节", 'success')
+                            index_content = '\n'.join(toc_lines) + '\n'
+                            (site_dir / '_目录.md').write_text(index_content, encoding='utf-8')
+                            self._log(f"目录索引: _目录.md", 'info')
+                            self._log(f"输出目录: {site_dir.resolve()}", 'info')
+                    else:
+                        self._log("单页模式，开始转换...", 'info')
+                        self.r.after(0, lambda: self.pv.set(50))
+                        _html_to_md(html, title, op, lambda m, t='info': self._log(m, t),
+                                  files_dict=images_dict if images_dict else None)
+
                     self.r.after(0, lambda: (self.pv.set(100), self.pl.config(text="完成！")))
                     self._log(f"\nURL → Markdown 转换完成", 'success')
-
-                self._log(f"输出目录: {Path(op).resolve()}", 'info')
+                    if not is_multi:
+                        self._log(f"输出目录: {Path(op).resolve()}", 'info')
 
                 # ── 检测过大文件（所有模式） ──
+                # rglob 递归搜索，整站分章节文件在子目录中也会被找到
                 out_path = Path(op)
                 big_files = []
                 for mf in sorted(out_path.rglob('*.md')):
