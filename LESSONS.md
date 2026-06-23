@@ -559,3 +559,53 @@ for f in self._cfg.__dataclass_fields__:
 - **功能测试应验证端到端数据流**，而非逐控件测试。在这个案例中，每个控件单独测试都"正常"（下拉框能选中、预览能显示、保存成功），但合在一起就不工作，因为数据流断了
 
 *记录于 2026-06-20*
+
+---
+
+### #31 Git 仓库重建策略：先 pull 远程再叠加新功能
+
+**场景**：本地 `.git` 目录意外丢失（如重建项目），但远程仓库有完整历史。
+
+**错误做法**：重新 `git init` 后直接 force push 新代码，这会丢失所有历史 commit。
+**正确做法**：
+1. `git init` → `git remote add origin` → `git fetch origin master`
+2. `git reset --hard origin/master` 恢复远程历史
+3. 在远程版本代码基础上精确叠加新功能（`replace_in_file` 而非全量覆盖）
+4. 保留原有的所有细节（如 TempFileManager、经验教训、递归分割等）
+5. `git add -A && git commit && git push`
+
+**教训**：
+- **重建 ≠ 重写**：项目文件丢失后重建，应以远程仓库为唯一信源，而非凭记忆重写
+- **全量覆盖是危险的**：新写的代码可能遗漏远程版本积累的边界处理（如 `_split_large_md` 的递归分割逻辑）
+- **diff 对比是必修课**：push 前必须确认 diff 只包含预期的增量改动，没有意外删除
+
+### #32 MHTML 解析：Python email 标准库是最佳选择
+
+**场景**：浏览器"另存为单个文件"(.mhtml) 是 MIME multipart/related 格式。
+
+**技术选型**：
+- `email.message_from_bytes()` 解析 MIME 结构
+- `.walk()` 遍历所有 part，提取 `text/html`
+- `.get_payload(decode=True)` 自动处理 quoted-printable/base64 编码
+- `email.header.decode_header()` 解码 RFC 2047 Subject 头获取标题
+
+**教训**：
+- **不要自己解析 MIME**：Python 标准库 email 模块已成熟处理所有边界情况
+- **encoding 回退链**：utf-8 → gbk → latin-1，因为中文 MHTML 可能用 gbk 编码
+- **标题优先级**：HTML `<title>` > MIME Subject > 文件名，因为 Subject 可能被截断
+
+### #33 bs4.Comment 导入方式：直接用 `from bs4 import Comment`
+
+**错误写法**：
+```python
+soup.find_all(string=lambda t: isinstance(t, type(soup('<!-- -->')[0])))
+```
+这在 BeautifulSoup 4.12+ 中会触发 `IndexError`，因为空文档中找不到注释。
+
+**正确写法**：
+```python
+from bs4 import Comment
+soup.find_all(string=lambda t: isinstance(t, Comment))
+```
+
+*记录于 2026-06-23*

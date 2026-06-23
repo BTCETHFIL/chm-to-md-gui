@@ -1,15 +1,21 @@
 #!/usr/bin/env python3
 """
-CHM → Markdown Converter (GUI)
-将 CHM 帮助文档一键转换为带层级编号的结构化 Markdown 文件。
+CHM/HTML/MHTML/URL → Markdown Converter (GUI)
+将 CHM 帮助文档、HTML 网页、MHTML 存档、在线 URL 转换为带层级编号的结构化 Markdown 文件。
+
+支持 6 种输入模式:
+  · CHM 单文件 / 多个 CHM / CHM 文件夹
+  · HTML 文件 (.html/.htm)
+  · MHTML 文件 (.mhtml, 浏览器单文件保存)
+  · 网页 URL (在线抓取)
 
 灵感来源: chy5301/chm-to-markdown-converter
 依赖安装: pip install -r requirements.txt
 """
 
-import os, re, json, base64, subprocess, tempfile, shutil, threading, time, atexit
+import os, re, json, base64, subprocess, tempfile, shutil, threading, time, atexit, email
 from pathlib import Path
-from urllib.parse import unquote
+from urllib.parse import unquote, urlparse
 from datetime import datetime, timedelta
 
 from bs4 import BeautifulSoup, Comment
@@ -24,6 +30,11 @@ try:
     HAS_PYPINYIN = True
 except ImportError:
     HAS_PYPINYIN = False
+try:
+    import requests
+    HAS_REQUESTS = True
+except ImportError:
+    HAS_REQUESTS = False
 
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox, scrolledtext
@@ -631,6 +642,166 @@ class TOCParser:
             child_ul = li.find("ul", recursive=False)
             if child_ul:
                 self._parse_ul(child_ul, node, level + 1)
+
+
+# ═══════════════════ MHTML / HTML / URL Input ═══════════════════
+
+def _parse_mhtml(filepath, log=None):
+    """解析 MHTML 文件，返回 (html_content, title)
+
+    MHTML 是浏览器"另存为单个文件"的格式，MIME multipart/related 包裹。
+    提取第一个 text/html 部分，自动处理 quoted-printable/base64 编码。
+    标题优先从 HTML <title> 提取，其次从 MIME Subject 头。
+    """
+    def _log(msg, tag='info'):
+        if log: log(msg, tag)
+
+    raw = Path(filepath).read_bytes()
+    msg = email.message_from_bytes(raw)
+
+    # 尝试从 Subject 头获取标题
+    mime_title = None
+    subject = msg.get('Subject', '')
+    if subject:
+        try:
+            from email.header import decode_header
+            parts = decode_header(subject)
+            mime_title = ''
+            for text, charset in parts:
+                if isinstance(text, bytes):
+                    mime_title += text.decode(charset or 'utf-8', errors='replace')
+                else:
+                    mime_title += text
+        except Exception:
+            mime_title = subject
+
+    # 提取 text/html 部分
+    html_body = None
+    for part in msg.walk():
+        ct = part.get_content_type()
+        if ct == 'text/html':
+            payload = part.get_payload(decode=True)
+            if payload:
+                # 尝试 UTF-8，失败则 latin-1
+                try:
+                    html_body = payload.decode('utf-8')
+                except UnicodeDecodeError:
+                    try:
+                        html_body = payload.decode('gbk')
+                    except UnicodeDecodeError:
+                        html_body = payload.decode('latin-1')
+                break
+
+    if not html_body:
+        raise ValueError("MHTML 文件中未找到 text/html 内容")
+
+    # 从 HTML <title> 提取标题
+    soup = BeautifulSoup(html_body, 'html.parser')
+    html_title = None
+    if soup.title and soup.title.string:
+        html_title = soup.title.string.strip()
+
+    title = html_title or mime_title or Path(filepath).stem
+    _log(f"MHTML 标题: {title}", 'info')
+    return html_body, title
+
+
+def _read_html_file(filepath, log=None):
+    """读取 HTML 文件，自动检测编码，返回 (html_content, title)"""
+    def _log(msg, tag='info'):
+        if log: log(msg, tag)
+
+    raw = Path(filepath).read_bytes()
+    html = decode_html(raw)
+    soup = BeautifulSoup(html, 'html.parser')
+    title = None
+    if soup.title and soup.title.string:
+        title = soup.title.string.strip()
+    title = title or Path(filepath).stem
+    _log(f"HTML 标题: {title}", 'info')
+    return html, title
+
+
+def _fetch_url(url, log=None):
+    """抓取网页 URL，返回 (html_content, title)"""
+    def _log(msg, tag='info'):
+        if log: log(msg, tag)
+
+    if HAS_REQUESTS:
+        headers = {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+        }
+        resp = requests.get(url, headers=headers, timeout=30)
+        resp.raise_for_status()
+        # 尝试从响应头获取编码
+        if resp.encoding and resp.encoding.lower() != 'iso-8859-1':
+            resp.encoding = resp.encoding
+        else:
+            # 从 HTML 内容探测编码
+            match = re.search(rb'charset=["\']?([a-zA-Z0-9\-]+)', resp.content[:4096])
+            if match:
+                try:
+                    resp.encoding = match.group(1).decode('ascii')
+                except Exception:
+                    pass
+        html = resp.text
+    else:
+        import urllib.request
+        req = urllib.request.Request(url, headers={
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+        })
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            raw = resp.read()
+            # 检测编码
+            encoding = resp.headers.get_content_charset()
+            if not encoding:
+                match = re.search(rb'charset=["\']?([a-zA-Z0-9\-]+)', raw[:4096])
+                encoding = match.group(1).decode('ascii') if match else 'utf-8'
+            try:
+                html = raw.decode(encoding)
+            except (UnicodeDecodeError, LookupError):
+                html = raw.decode('utf-8', errors='replace')
+
+    soup = BeautifulSoup(html, 'html.parser')
+    title = None
+    if soup.title and soup.title.string:
+        title = soup.title.string.strip()
+    title = title or urlparse(url).netloc or 'webpage'
+    _log(f"URL 标题: {title}", 'info')
+    return html, title
+
+
+def _html_to_md(html, title, out_dir, log=None):
+    """将 HTML 内容转换为 Markdown 文件，保存到 out_dir
+
+    返回生成的 .md 文件路径。
+    复用现有的 HTMLCleaner + MDConverter + fix_markdown_links 引擎。
+    """
+    def _log(msg, tag='info'):
+        if log: log(msg, tag)
+
+    _log(f"处理: {title}", 'info')
+
+    # 清理 HTML
+    cleaner = HTMLCleaner()
+    cleaned = cleaner.clean(html)
+
+    # 转换
+    conv = MDConverter()
+    md = conv.convert(cleaned)
+
+    # 修复链接
+    md = fix_markdown_links(md)
+
+    # 写入文件
+    fn = _clean_path(title) or 'index'
+    if not fn.endswith('.md'):
+        fn += '.md'
+    out_path = Path(out_dir) / fn
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    out_path.write_text(md, encoding='utf-8')
+    _log(f"已保存: {out_path.name} ({len(md)} 字符)", 'success')
+    return str(out_path)
 
 
 # ═══════════════════ CHM Extraction ═══════════════════
@@ -1361,8 +1532,8 @@ def _split_large_md(filepath, max_mb=10, log=None):
 class App:
     def __init__(self, r):
         self.r = r
-        r.title("CHM → Markdown Converter v2")
-        r.geometry("760x720"); r.minsize(600, 540)
+        r.title("CHM/HTML/MHTML/URL → Markdown v3")
+        r.geometry("760x760"); r.minsize(600, 580)
         self.run = False
         s = ttk.Style(); s.theme_use('clam')
         s.configure('TButton', font=('Microsoft YaHei', 10))
@@ -1393,20 +1564,34 @@ class App:
         top = ttk.Frame(self.r, padding=(15, 15, 15, 5)); top.pack(fill='x')
         mode_lbl = ttk.Label(top, text="模式：")
         mode_lbl.pack(side='left')
-        Tooltip(mode_lbl, "选择输入方式：单文件、多文件或整个文件夹")
+        Tooltip(mode_lbl, "选择输入方式：CHM/HTML/MHTML/URL")
         self.m = tk.StringVar(value='single')
-        rb1 = ttk.Radiobutton(top, text="单个文件", variable=self.m,
-                              value='single', command=self._fm)
-        rb1.pack(side='left', padx=(10, 5))
-        Tooltip(rb1, "选择一个 .chm 文件进行转换")
-        rb2 = ttk.Radiobutton(top, text="多个文件", variable=self.m,
-                              value='multi', command=self._fm)
-        rb2.pack(side='left', padx=5)
-        Tooltip(rb2, "一次选择多个 .chm 文件批量转换")
-        rb3 = ttk.Radiobutton(top, text="整个文件夹", variable=self.m,
-                              value='folder', command=self._fm)
-        rb3.pack(side='left')
-        Tooltip(rb3, "选择文件夹，自动扫描其中所有 .chm 文件")
+
+        # 第一行: CHM 三种模式
+        row1 = ttk.Frame(self.r, padding=(15, 0, 15, 0)); row1.pack(fill='x')
+        ttk.Label(row1, text="  CHM:", font=('Microsoft YaHei', 9, 'bold')).pack(side='left')
+        for val, txt, tip in [
+            ('single', '单个文件', '选择一个 .chm 文件进行转换'),
+            ('multi', '多个文件', '一次选择多个 .chm 文件批量转换'),
+            ('folder', '整个文件夹', '选择文件夹，自动扫描其中所有 .chm 文件'),
+        ]:
+            rb = ttk.Radiobutton(row1, text=txt, variable=self.m,
+                                 value=val, command=self._fm)
+            rb.pack(side='left', padx=(8, 2))
+            Tooltip(rb, tip)
+
+        # 第二行: HTML / MHTML / URL
+        row2 = ttk.Frame(self.r, padding=(15, 2, 15, 0)); row2.pack(fill='x')
+        ttk.Label(row2, text="  其他:", font=('Microsoft YaHei', 9, 'bold')).pack(side='left')
+        for val, txt, tip in [
+            ('html', 'HTML 文件', '选择一个 .html/.htm 网页文件转换'),
+            ('mhtml', 'MHTML 文件', '选择浏览器保存的 .mhtml 单文件'),
+            ('url', '网页 URL', '输入在线网页地址，自动抓取并转换'),
+        ]:
+            rb = ttk.Radiobutton(row2, text=txt, variable=self.m,
+                                 value=val, command=self._fm)
+            rb.pack(side='left', padx=(8, 2))
+            Tooltip(rb, tip)
 
         # ── 工具状态 ──
         tools = self._check_tools()
@@ -1436,12 +1621,12 @@ class App:
         self.il = ttk.Label(f1, text="CHM 文件："); self.il.pack(anchor='w', pady=(0, 5))
         r1 = ttk.Frame(f1); r1.pack(fill='x')
         self.iv = tk.StringVar()
-        ent = ttk.Entry(r1, textvariable=self.iv)
-        ent.pack(side='left', fill='x', expand=True)
-        Tooltip(ent, "所选 CHM 文件的路径\n也可直接粘贴路径到此处")
-        btn_browse = ttk.Button(r1, text="浏览...", command=self._bi)
-        btn_browse.pack(side='left', padx=(8, 0))
-        Tooltip(btn_browse, "打开文件对话框选择 CHM 文件或文件夹")
+        self.ent = ttk.Entry(r1, textvariable=self.iv)
+        self.ent.pack(side='left', fill='x', expand=True)
+        Tooltip(self.ent, "所选文件的路径\nCHM/HTML/MHTML 模式可直接粘贴路径\nURL 模式请输入网址")
+        self.btn_browse = ttk.Button(r1, text="浏览...", command=self._bi)
+        self.btn_browse.pack(side='left', padx=(8, 0))
+        Tooltip(self.btn_browse, "打开文件对话框选择文件或文件夹")
 
         # ── 输出 ──
         f2 = ttk.LabelFrame(self.r, text="输出", padding=(15, 10))
@@ -1484,8 +1669,16 @@ class App:
 
     def _fm(self):
         mode = self.m.get()
-        labels = {'single': "CHM 文件：", 'multi': "CHM 文件：", 'folder': "CHM 文件夹："}
+        labels = {
+            'single': "CHM 文件：", 'multi': "CHM 文件：", 'folder': "CHM 文件夹：",
+            'html': "HTML 文件：", 'mhtml': "MHTML 文件：", 'url': "网页 URL：",
+        }
+        browse_texts = {
+            'single': "浏览...", 'multi': "浏览...", 'folder': "浏览...",
+            'html': "选择 HTML...", 'mhtml': "选择 MHTML...", 'url': "抓取",
+        }
         self.il.config(text=labels.get(mode, "选择："))
+        self.btn_browse.config(text=browse_texts.get(mode, "浏览..."))
         self._files = []; self.iv.set('')
 
     def _bi(self):
@@ -1499,9 +1692,22 @@ class App:
             if paths:
                 self._files = list(paths)
                 self.iv.set(f"已选择 {len(paths)} 个文件")
-        else:
+        elif mode == 'folder':
             p = filedialog.askdirectory(title="选择包含 CHM 文件的文件夹")
             if p: self.iv.set(p); self._files = sorted(str(f) for f in Path(p).glob("*.chm"))
+        elif mode == 'html':
+            p = filedialog.askopenfilename(
+                title="选择 HTML 文件",
+                filetypes=[("HTML 文件", "*.html *.htm"), ("所有文件", "*.*")])
+            if p: self.iv.set(p); self._files = [p]
+        elif mode == 'mhtml':
+            p = filedialog.askopenfilename(
+                title="选择 MHTML 文件",
+                filetypes=[("MHTML 文件", "*.mhtml *.mht"), ("所有文件", "*.*")])
+            if p: self.iv.set(p); self._files = [p]
+        elif mode == 'url':
+            # URL 模式不需要浏览文件，输入框即可
+            pass
 
     def _bo(self):
         p = filedialog.askdirectory(title="选择输出目录")
@@ -1516,26 +1722,50 @@ class App:
         if not op:
             op = str(Path(__file__).parent / 'md_output')
 
-        tasks = []
         mode = self.m.get()
-        if mode == 'single':
+        tasks = []
+        input_type = 'chm'  # chm | html | mhtml | url
+
+        if mode in ('single', 'multi', 'folder'):
+            # ── CHM 模式 ──
+            if mode == 'single':
+                ip = self.iv.get().strip()
+                if not ip: messagebox.showwarning("提示", "请选择一个文件！"); return
+                if not os.path.exists(ip): messagebox.showerror("错误", "文件不存在"); return
+                tasks = [ip]
+            elif mode == 'multi':
+                if not self._files: messagebox.showwarning("提示", "请先选择文件！"); return
+                tasks = sorted(self._files)
+            else:
+                ip = self.iv.get().strip()
+                if not ip: messagebox.showwarning("提示", "请选择一个文件夹！"); return
+                tasks = sorted(str(f) for f in Path(ip).glob("*.chm"))
+                if not tasks:
+                    messagebox.showwarning("提示", "文件夹中没有 .chm 文件"); return
+            input_type = 'chm'
+        elif mode == 'html':
             ip = self.iv.get().strip()
-            if not ip: messagebox.showwarning("提示", "请选择一个文件！"); return
+            if not ip: messagebox.showwarning("提示", "请选择 HTML 文件！"); return
             if not os.path.exists(ip): messagebox.showerror("错误", "文件不存在"); return
             tasks = [ip]
-        elif mode == 'multi':
-            if not self._files: messagebox.showwarning("提示", "请先选择文件！"); return
-            tasks = sorted(self._files)
-        else:
+            input_type = 'html'
+        elif mode == 'mhtml':
             ip = self.iv.get().strip()
-            if not ip: messagebox.showwarning("提示", "请选择一个文件夹！"); return
-            tasks = sorted(str(f) for f in Path(ip).glob("*.chm"))
-            if not tasks:
-                messagebox.showwarning("提示", "文件夹中没有 .chm 文件"); return
+            if not ip: messagebox.showwarning("提示", "请选择 MHTML 文件！"); return
+            if not os.path.exists(ip): messagebox.showerror("错误", "文件不存在"); return
+            tasks = [ip]
+            input_type = 'mhtml'
+        elif mode == 'url':
+            url = self.iv.get().strip()
+            if not url: messagebox.showwarning("提示", "请输入网页 URL！"); return
+            if not url.startswith(('http://', 'https://')):
+                url = 'https://' + url
+            tasks = [url]
+            input_type = 'url'
 
-        # ── 多文件时询问是否整体统一编号 ──
+        # ── CHM 多文件时询问是否整体统一编号 ──
         unified = False
-        if len(tasks) > 1:
+        if input_type == 'chm' and len(tasks) > 1:
             unified = messagebox.askyesno(
                 "编号方式",
                 f"检测到 {len(tasks)} 个 CHM 文件。\n\n"
@@ -1553,30 +1783,60 @@ class App:
 
         def work():
             try:
-                self._log("CHM → Markdown 转换器 v2", 'info')
-                self._log("基于 chm-to-markdown-converter (github.com/chy5301)", 'info')
+                self._log("CHM/HTML/MHTML/URL → Markdown v3", 'info')
                 self._log("=" * 50, 'info')
-                count = 0; total = len(tasks)
-                self._log(f"待处理文件数: {total}", 'info')
-                if unified:
-                    self._log("编号方式: 整体统一编号", 'info')
-                else:
-                    self._log("编号方式: 各文件独立编号", 'info')
-                for i, cf in enumerate(tasks):
-                    pct = 10 + 85 * i // total if total else 100
-                    self.r.after(0, lambda p=pct, t=f"{i+1}/{total}": (
-                        self.pv.set(p), self.pl.config(text=t)))
-                    try:
-                        bnum = (i + 1) if unified else None
-                        n, out_dir = convert_chm(
-                            cf, op, lambda m, t='info': self._log(m, t), bnum)
-                        count += n
-                    except Exception as e:
-                        self._log(f"失败: {Path(cf).name}: {e}", 'error')
-                self.r.after(0, lambda: (self.pv.set(100), self.pl.config(text="完成！")))
-                self._log(f"\n总计: {count} 个 .md 文件（来自 {total} 个 CHM）", 'success')
+
+                if input_type == 'chm':
+                    count = 0; total = len(tasks)
+                    self._log(f"待处理 CHM 文件数: {total}", 'info')
+                    if unified:
+                        self._log("编号方式: 整体统一编号", 'info')
+                    else:
+                        self._log("编号方式: 各文件独立编号", 'info')
+                    for i, cf in enumerate(tasks):
+                        pct = 10 + 85 * i // total if total else 100
+                        self.r.after(0, lambda p=pct, t=f"{i+1}/{total}": (
+                            self.pv.set(p), self.pl.config(text=t)))
+                        try:
+                            bnum = (i + 1) if unified else None
+                            n, out_dir = convert_chm(
+                                cf, op, lambda m, t='info': self._log(m, t), bnum)
+                            count += n
+                        except Exception as e:
+                            self._log(f"失败: {Path(cf).name}: {e}", 'error')
+                    self.r.after(0, lambda: (self.pv.set(100), self.pl.config(text="完成！")))
+                    self._log(f"\n总计: {count} 个 .md 文件（来自 {total} 个 CHM）", 'success')
+
+                elif input_type == 'html':
+                    self._log(f"输入: HTML 文件 ({Path(tasks[0]).name})", 'info')
+                    self.r.after(0, lambda: self.pv.set(20))
+                    html, title = _read_html_file(tasks[0], lambda m, t='info': self._log(m, t))
+                    self.r.after(0, lambda: self.pv.set(50))
+                    _html_to_md(html, title, op, lambda m, t='info': self._log(m, t))
+                    self.r.after(0, lambda: (self.pv.set(100), self.pl.config(text="完成！")))
+                    self._log(f"\nHTML → Markdown 转换完成", 'success')
+
+                elif input_type == 'mhtml':
+                    self._log(f"输入: MHTML 文件 ({Path(tasks[0]).name})", 'info')
+                    self.r.after(0, lambda: self.pv.set(20))
+                    html, title = _parse_mhtml(tasks[0], lambda m, t='info': self._log(m, t))
+                    self.r.after(0, lambda: self.pv.set(50))
+                    _html_to_md(html, title, op, lambda m, t='info': self._log(m, t))
+                    self.r.after(0, lambda: (self.pv.set(100), self.pl.config(text="完成！")))
+                    self._log(f"\nMHTML → Markdown 转换完成", 'success')
+
+                elif input_type == 'url':
+                    self._log(f"输入: URL ({tasks[0]})", 'info')
+                    self.r.after(0, lambda: (self.pv.set(10), self.pl.config(text="正在抓取网页...")))
+                    html, title = _fetch_url(tasks[0], lambda m, t='info': self._log(m, t))
+                    self.r.after(0, lambda: self.pv.set(50))
+                    _html_to_md(html, title, op, lambda m, t='info': self._log(m, t))
+                    self.r.after(0, lambda: (self.pv.set(100), self.pl.config(text="完成！")))
+                    self._log(f"\nURL → Markdown 转换完成", 'success')
+
                 self._log(f"输出目录: {Path(op).resolve()}", 'info')
-                # ── 检测过大文件 ──
+
+                # ── 检测过大文件（所有模式） ──
                 out_path = Path(op)
                 big_files = []
                 for mf in sorted(out_path.rglob('*.md')):
@@ -1589,7 +1849,6 @@ class App:
                     self._log(f"\n⚠ 检测到 {len(big_files)} 个文件超过 10 MB:", 'warn')
                     for bf, sz in big_files:
                         self._log(f"  {Path(bf).name} ({sz / 1024 / 1024:.1f} MB)", 'warn')
-                    # 在主线程弹窗询问
                     self.r.after(0, lambda bf=big_files: self._ask_split(bf))
             except Exception as e:
                 self._log(f"致命错误: {e}", 'error')
