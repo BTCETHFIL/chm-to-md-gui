@@ -608,4 +608,107 @@ from bs4 import Comment
 soup.find_all(string=lambda t: isinstance(t, Comment))
 ```
 
+### #34 项目文件消失事故：write_to_file 覆写整个项目目录
+
+**事故**：2026-06-23，`CHM文件转为MD文件/` 目录被意外清空，`.git`（含18次commit历史）一并丢失。幸好6月20日已push到GitHub，远程仓库有完整备份。
+
+**根因分析**：
+- 在重构/重建项目时，AI 调用了 `write_to_file` 覆写整个目录，将所有文件（包括 `.git`）清空后重建
+- `write_to_file` 直接覆写文件系统，**不经过 Windows 回收站**，文件永久消失
+- 回收站检查确认：无任何相关文件可恢复
+
+**预防措施（硬性规则）**：
+1. **🚫 禁止对已有项目使用 `write_to_file` 做"重建"**：只能使用 `replace_in_file` 做增量修改
+2. **🚫 禁止 `write_to_file` 写入项目根目录的已有文件**：先 `read_file` 确认内容，再用 `replace_in_file` 修改
+3. **✅ 新建文件可以用 `write_to_file`**，但仅限于之前不存在的文件
+4. **✅ 每个重要功能完成后立即 push 到 GitHub**：远程仓库是最后的保命线
+5. **✅ 做任何目录级操作前，先 `list_dir` 确认当前目录状态**，了解有哪些文件后再说
+
+**教训**：
+- **覆写是删除的别名**：`write_to_file` 对已有文件等同于 `rm -rf` + 新建，不经过回收站
+- **`.git` 不是护身符**：它只是目录里的子文件夹，目录被清空时它一起消失
+- **GitHub 是救命稻草**：这次能恢复全靠 6月20日的推送，证明推送纪律是项目存亡的关键
+- **备份之外需要防御**：与其事后从备份恢复，不如事前防止覆写——禁止对已有目录使用 `write_to_file`
+
 *记录于 2026-06-23*
+
+---
+
+### #35 Playwright Page 对象泄漏：goto 抛异常时 close 跳过
+
+**场景**：`_crawl_multi_page` 中逐页抓取循环内：
+```python
+sp = context.new_page()
+sp.goto(url, ...)   # 抛异常 → sp.close() 永远不执行
+```
+
+**修复**：
+```python
+sp = None
+try:
+    sp = context.new_page()
+    sp.goto(url, ...)
+    ...
+finally:
+    if sp is not None:
+        try: sp.close()
+        except Exception: pass
+```
+
+**教训**：
+- `try/finally` 中的 `finally` 不是"选配"——任何资源获取和释放之间只要有异常可能，就必须配对
+- `sp = None` 初始化是最廉价的防御：即使 `new_page()` 抛异常，`finally` 也不会报 `NameError`
+- 自检方法论：逐行审查每个 `try` 块的"如果这里抛异常，下面哪些代码会被跳过"
+
+---
+
+### #36 整站爬取：合并单文件 → 分章节独立文件
+
+**场景**：CHM 项目整站爬取将全部页面合并为一个 MD，文件过大（几十 MB），用户无法按章节定位内容。
+
+**方案**：
+- `_crawl_multi_page` 返回值从 `(合并HTML, ...)` 改为 `(page_data_list, ...)`
+- 每页单独调用 `_html_to_md(..., basename=filename)` 保存
+- 生成 `_目录.md` 索引文件，含 Markdown 链接 `- [1.1 章节名](1.1 章节名.md)`
+- 图片复用：`combined_images`（全部图片）传给每页，`_embed_images` 按 `img` src 自动匹配
+
+**教训**：
+- **大文件在 IDE 中几乎不可用**：几十 MB 的单文件打开卡顿、搜索慢、Git diff 膨胀
+- **图片不要按页过滤分发**：全量传入让匹配引擎自动决定，提前分拣会增加复杂度和出错概率
+- **索引文件是必需品**：分散的文件没有目录就没法导航，`_目录.md` 和章节文件是共生关系
+
+---
+
+### #37 page.title() 不可靠：侧边栏根条目才是真实名称
+
+**场景**：三个 fbox360 帮助页整站爬取后，自动生成的文件夹名全部错误：
+| URL | `page.title()` | 侧边栏第一条 |
+|-----|----------------|-------------|
+| `/guide/productoverview.html` | `\| 客户端软件文档` | `客户端软件操作指南` |
+| `/answer/configuration.html` | `\| 客户端软件文档` | `FBox常见问题解答` |
+| `/employ/index.html` | `FBox...主题 \| 客户端软件文档` | `MQTT 使用指南` |
+
+**根因**：HTML `<title>` 标签被 SEO 后缀 `| 客户端软件文档` 污染，且多个页面的 title 完全相同（导致重名）。
+
+**修复**：新增 `_derive_site_folder_name(title, nav_entries, url)`，优先级：侧边栏首个 level=1 条目 → 清理 title 后缀 → 域名兜底。
+
+**教训**：
+- **`page.title()` 是 UI 标题，不是数据标题**：HTML 作者为 SEO/品牌在标题里堆砌后缀，爬虫不应直接拿来做文件名
+- **侧边栏是站点结构的金标准**：它由文档工具自动生成，层级和标题都经过规范化
+- **重名是隐式 bug**：程序不会报错，但第二个爬取结果会覆盖第一个的文件夹——用户发现时已经晚了
+
+---
+
+### #38 向前兼容的 API 重构：参数传递 > 类型变换
+
+**场景**：修改 `_crawl_multi_page` 返回值（#36）后，所有调用方都要改解包。同时新增 `existing_images` 参数消除冗余首页加载（#35 自检发现）。
+
+**原则**：
+- 新增参数用默认值保证旧调用不报错：`existing_images=None`
+- 返回值结构变化时，同步更新所有调用方和新旧变量名（`site_title_new` 替代冲突的 `site_title`）
+- 参数从 `(url, log, nav_entries)` 扩展到 `(url, log, nav_entries, site_title, existing_images)` 时，所有关键字参数用显式名称传递
+
+**教训**：
+- **默认值是最低成本的兼容层**：一个 `=None` 让新旧调用共存
+- **解包变量改名是重构的暗礁**：`combined_html = ...` 改为 `site_title_new, page_data_list = ...` 后，下游用到旧变量名的代码会静默引用旧值——必须全局搜索替换
+- **参数扩展用关键字传递**：位置参数扩展后，旧调用的参数顺序全乱，关键字参数天然免疫
